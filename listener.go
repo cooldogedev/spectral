@@ -49,7 +49,6 @@ func newListener(conn *net.UDPConn) *Listener {
 			c, ok := listener.connections[connectionID]
 			if !ok && slices.ContainsFunc(frames, func(fr frame.Frame) bool { return fr.ID() == frame.IDConnectionRequest }) {
 				c = newServerConnection(internal.NewConn(conn, addr, false), listener.connectionID, listener.ctx)
-				connectionID = listener.connectionID
 				listener.connections[listener.connectionID] = c
 				listener.connectionID++
 				listener.incomingConnections <- c

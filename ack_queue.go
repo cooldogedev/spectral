@@ -25,7 +25,7 @@ func (a *ackQueue) add(sequenceID uint32) {
 func (a *ackQueue) flush() (delay int64, list []uint32) {
 	a.mu.Lock()
 	if len(a.list) >= 0 {
-		delay = time.Now().Sub(a.lastAck).Nanoseconds()
+		delay = time.Since(a.lastAck).Nanoseconds()
 		list = a.list
 		a.list = nil
 	}

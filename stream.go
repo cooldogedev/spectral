@@ -170,7 +170,6 @@ func (s *Stream) handleSingle(sequenceID uint32, p []byte) {
 	s.buf = append(s.buf, p...)
 	s.mu.Unlock()
 	s.cond.Signal()
-	return
 }
 
 func (s *Stream) handleSplit(sequenceID uint32, fragments [][]byte) {
@@ -190,7 +189,6 @@ func (s *Stream) handleSplit(sequenceID uint32, fragments [][]byte) {
 	}
 	s.mu.Unlock()
 	s.cond.Signal()
-	return
 }
 
 func (s *Stream) order() {
