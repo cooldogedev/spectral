@@ -15,7 +15,7 @@ These examples demonstrate how to set up an echo server and client using Spectra
 
 Spectral is implemented in:
 
-- **Spectral-PHP**: [Spectral PHP](https://github.com/cooldogedev/spectral-php)
+- **PHP**: [Spectral PHP](https://github.com/cooldogedev/spectral-php)
 
 ## Projects Using Spectral
 
