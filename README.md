@@ -2,14 +2,9 @@
 
 **Spectral** is a lightweight, high-performance network engine built on UDP, designed for real-time applications such as gaming and streaming that require low-latency communication.
 
-## Example Code
+## Examples
 
-For practical usage, refer to the example implementations:
-
-- **Echo Server**: [Example Code (`example/server.go`)](./example/server.go)
-- **Echo Client**: [Example Code (`example/client.go`)](./example/client.go)
-
-These examples demonstrate how to set up an echo server and client using Spectral.
+Explore how to use Spectral in the [example](example) directory.
 
 ## Implementations
 
