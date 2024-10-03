@@ -9,9 +9,11 @@ import (
 )
 
 const (
-	MaxCwnd = 1000000
-	C       = 0.7
-	Beta    = 0.4
+	initialWindow = protocol.MaxPacketSize * 32
+	maxWindow     = 1000000
+
+	cubicC    = 0.7
+	cubicBeta = 0.4
 )
 
 type Cubic struct {
@@ -26,8 +28,8 @@ type Cubic struct {
 
 func NewCubic() *Cubic {
 	return &Cubic{
-		cwnd:     10 * protocol.MaxPacketSize,
-		wMax:     10 * protocol.MaxPacketSize,
+		cwnd:     initialWindow,
+		wMax:     initialWindow,
 		ssthresh: math.Inf(1),
 	}
 }
@@ -48,30 +50,30 @@ func (c *Cubic) OnAck(bytes float64) {
 
 	c.inFlight = max(c.inFlight-bytes, 0)
 	if c.ssthresh > c.cwnd {
-		c.cwnd = min(c.cwnd+bytes, MaxCwnd)
+		c.cwnd = min(c.cwnd+bytes, maxWindow)
 		return
 	}
 
 	if c.epochStart.IsZero() {
 		c.epochStart = time.Now()
-		c.k = math.Cbrt(c.wMax * (1.0 - Beta) / C)
+		c.k = math.Cbrt(c.wMax * (1.0 - cubicBeta) / cubicC)
 	}
 
 	elapsed := time.Since(c.epochStart).Seconds()
-	cwnd := C*math.Pow(elapsed-c.k, 3) + c.wMax
+	cwnd := cubicC*math.Pow(elapsed-c.k, 3) + c.wMax
 	if cwnd > c.cwnd {
-		c.cwnd = min(cwnd, MaxCwnd)
+		c.cwnd = min(cwnd, maxWindow)
 	}
 }
 
 func (c *Cubic) OnLoss(bytes float64) {
 	c.mu.Lock()
 	c.wMax = c.cwnd
-	c.cwnd *= Beta
+	c.cwnd *= cubicBeta
 	c.inFlight = max(c.inFlight-bytes, 0)
 	c.ssthresh = c.cwnd
 	c.epochStart = time.Time{}
-	c.k = math.Cbrt(c.wMax * (1.0 - Beta) / C)
+	c.k = math.Cbrt(c.wMax * (1.0 - cubicBeta) / cubicC)
 	c.mu.Unlock()
 }
 
