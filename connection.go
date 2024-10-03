@@ -51,7 +51,7 @@ func newConnection(conn *internal.Conn, connectionID protocol.ConnectionID, pare
 		ctx:            ctx,
 		cancelFunc:     cancelFunc,
 		cc:             congestion.NewCubic(),
-		pacer:          congestion.NewPacer(time.Millisecond*100, 30),
+		pacer:          congestion.NewPacer(internal.DefaultRTT, 30),
 		ack:            newAckQueue(),
 		receivedQueue:  newReceiveQueue(),
 		retransmission: newRetransmissionQueue(),

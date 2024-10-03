@@ -6,9 +6,10 @@ import (
 )
 
 const (
-	alpha         = 0.1
+	DefaultRTT = time.Millisecond * 100
+
+	alpha         = 0.125
 	alphaMinusOne = 1.0 - alpha
-	defaultRTT    = time.Millisecond * 100
 )
 
 type RTT struct {
@@ -16,16 +17,22 @@ type RTT struct {
 }
 
 func NewRTT() *RTT {
-	r := &RTT{}
-	r.rtt.Store(int64(defaultRTT))
-	return r
+	return &RTT{}
 }
 
-func (c *RTT) Add(rtt time.Duration) {
-	currentRTT := float64(c.rtt.Load())
-	c.rtt.Store(int64(alpha*float64(rtt) + alphaMinusOne*currentRTT))
+func (r *RTT) Add(rtt time.Duration) {
+	if rtt <= 0 {
+		return
+	}
+
+	currentRTT := float64(r.rtt.Load())
+	if currentRTT == 0 {
+		r.rtt.Store(int64(rtt))
+	} else {
+		r.rtt.Store(int64(alpha*float64(rtt) + alphaMinusOne*currentRTT))
+	}
 }
 
-func (c *RTT) RTT() time.Duration {
-	return time.Duration(c.rtt.Load())
+func (r *RTT) RTT() time.Duration {
+	return time.Duration(r.rtt.Load())
 }

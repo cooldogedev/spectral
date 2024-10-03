@@ -5,17 +5,17 @@ import "time"
 const bytesPerToken = 512
 
 type Pacer struct {
-	interval   time.Duration
 	capacity   int
 	tokens     int
+	interval   time.Duration
 	lastRefill time.Time
 }
 
 func NewPacer(interval time.Duration, capacity int) *Pacer {
 	return &Pacer{
-		interval:   interval,
 		capacity:   capacity,
 		tokens:     capacity,
+		interval:   interval,
 		lastRefill: time.Now(),
 	}
 }
