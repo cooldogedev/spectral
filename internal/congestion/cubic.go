@@ -78,5 +78,11 @@ func (c *Cubic) OnLoss(bytes float64) {
 func (c *Cubic) Cwnd() float64 {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.cwnd - c.inFlight
+	return c.cwnd
+}
+
+func (c *Cubic) InFlight() float64 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.inFlight
 }

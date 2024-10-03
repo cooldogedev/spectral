@@ -2,10 +2,7 @@ package congestion
 
 import "time"
 
-const (
-	minInterval   = time.Microsecond * 50
-	bytesPerToken = 512
-)
+const bytesPerToken = 512
 
 type Pacer struct {
 	interval   time.Duration
@@ -40,5 +37,7 @@ func (p *Pacer) Consume(bytes int) time.Duration {
 }
 
 func (p *Pacer) SetInterval(interval time.Duration) {
-	p.interval = max(interval, minInterval)
+	if interval > 0 {
+		p.interval = interval
+	}
 }

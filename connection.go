@@ -246,7 +246,9 @@ func (c *connection) acknowledge() (err error) {
 
 func (c *connection) transmit() (err error) {
 	sequenceID, pk := c.sendQueue.shift()
-	c.pacer.SetInterval(time.Duration(c.rtt.RTT().Seconds()/c.cc.Cwnd()) * time.Second)
+	cwnd := c.cc.Cwnd()
+	inFlight := c.cc.InFlight()
+	c.pacer.SetInterval(time.Duration((float64(c.rtt.RTT()) / cwnd) * (cwnd - inFlight)))
 	if d := c.pacer.Consume(len(pk)); d > 0 {
 		time.Sleep(d)
 	}
