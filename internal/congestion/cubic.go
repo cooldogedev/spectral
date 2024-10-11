@@ -73,11 +73,11 @@ func (c *Cubic) OnAck(bytes float64) {
 	}
 }
 
-func (c *Cubic) OnLoss(bytes float64) {
+func (c *Cubic) OnLoss() {
 	c.mu.Lock()
+	c.inFlight = 0
 	c.wMax = c.cwnd
 	c.cwnd = max(c.cwnd*cubicBeta, minWindow)
-	c.inFlight = max(c.inFlight-bytes, 0)
 	c.ssthresh = c.cwnd
 	c.epochStart = time.Time{}
 	c.k = math.Cbrt(c.wMax * (1.0 - cubicBeta) / cubicC)

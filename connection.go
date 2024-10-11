@@ -267,7 +267,7 @@ func (c *connection) transmit() (err error) {
 
 func (c *connection) retransmit() (err error) {
 	if pk := c.retransmission.shift(); pk != nil {
-		c.cc.OnLoss(float64(len(pk)))
+		c.cc.OnLoss()
 		if _, err := c.conn.Write(pk); err != nil {
 			return err
 		}
