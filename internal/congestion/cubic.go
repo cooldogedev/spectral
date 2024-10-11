@@ -9,6 +9,8 @@ import (
 )
 
 const (
+	maxBurstPackets = 3
+
 	initialWindow = protocol.MaxPacketSize * 32
 	minWindow     = protocol.MaxPacketSize * 2
 	maxWindow     = protocol.MaxPacketSize * 10000
@@ -50,6 +52,10 @@ func (c *Cubic) OnAck(bytes float64) {
 	defer c.mu.Unlock()
 
 	c.inFlight = max(c.inFlight-bytes, 0)
+	if !c.shouldIncreaseWindow() {
+		return
+	}
+
 	if c.ssthresh > c.cwnd {
 		c.cwnd = min(c.cwnd+bytes, maxWindow)
 		return
@@ -88,4 +94,13 @@ func (c *Cubic) InFlight() float64 {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.inFlight
+}
+
+func (c *Cubic) shouldIncreaseWindow() bool {
+	if c.inFlight >= c.cwnd {
+		return true
+	}
+	availableBytes := c.cwnd - c.inFlight
+	slowStartLimited := c.ssthresh > c.cwnd && c.inFlight > c.cwnd/2
+	return slowStartLimited || availableBytes <= maxBurstPackets*protocol.MaxPacketSize
 }
