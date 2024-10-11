@@ -52,7 +52,7 @@ func newConnection(conn *internal.Conn, connectionID protocol.ConnectionID, pare
 		ctx:            ctx,
 		cancelFunc:     cancelFunc,
 		cc:             congestion.NewCubic(),
-		pacer:          congestion.NewPacer(internal.DefaultRTT, 30),
+		pacer:          congestion.NewPacer(),
 		ack:            newAckQueue(),
 		receiveQueue:   newReceiveQueue(),
 		retransmission: newRetransmissionQueue(),
@@ -187,11 +187,11 @@ func (c *connection) receive(sequenceID uint32, frames []frame.Frame) (err error
 func (c *connection) handle(fr frame.Frame) (err error) {
 	switch fr := fr.(type) {
 	case *frame.Acknowledgement:
-		var ackBytes float64
+		var ackBytes uint64
 		for i, r := range fr.Ranges {
 			for j := r[0]; j <= r[1]; j++ {
 				if entry := c.retransmission.remove(j); entry != nil {
-					ackBytes += float64(len(entry.payload))
+					ackBytes += uint64(len(entry.payload))
 					if i == len(fr.Ranges)-1 && j == r[1] {
 						c.rtt.Add(time.Duration(time.Since(entry.timestamp).Nanoseconds()-fr.Delay) * time.Nanosecond)
 					}
@@ -260,18 +260,18 @@ func (c *connection) acknowledge() (err error) {
 }
 
 func (c *connection) transmit() (err error) {
+	rtt := c.rtt.RTT()
 	sequenceID, pk := c.sendQueue.shift()
-	cwnd := c.cc.Cwnd()
-	inFlight := c.cc.InFlight()
-	c.pacer.SetInterval(time.Duration((float64(c.rtt.RTT()) / cwnd) * (cwnd - inFlight)))
-	if d := c.pacer.Consume(len(pk)); d > 0 {
+	for !c.cc.CanSend(uint64(len(pk))) {
+		time.Sleep(rtt)
+	}
+
+	if d := c.pacer.Delay(rtt, uint64(len(pk)), c.cc.Cwnd()); d > 0 {
 		time.Sleep(d)
 	}
 
-	for !c.cc.OnSend(float64(len(pk))) {
-		time.Sleep(c.rtt.RTT())
-	}
-
+	c.cc.OnSend(uint64(len(pk)))
+	c.pacer.OnSend(uint64(len(pk)))
 	c.retransmission.add(sequenceID, pk)
 	if _, err := c.conn.Write(pk); err != nil {
 		return err

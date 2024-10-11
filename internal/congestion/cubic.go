@@ -15,15 +15,15 @@ const (
 	minWindow     = protocol.MaxPacketSize * 2
 	maxWindow     = protocol.MaxPacketSize * 10000
 
-	cubicC    = 0.7
 	cubicBeta = 0.4
+	cubicC    = 0.7
 )
 
 type Cubic struct {
-	inFlight   float64
-	cwnd       float64
-	wMax       float64
-	ssthresh   float64
+	inFlight   uint64
+	cwnd       uint64
+	wMax       uint64
+	ssthresh   uint64
 	k          float64
 	epochStart time.Time
 	mu         sync.RWMutex
@@ -33,21 +33,23 @@ func NewCubic() *Cubic {
 	return &Cubic{
 		cwnd:     initialWindow,
 		wMax:     initialWindow,
-		ssthresh: math.Inf(1),
+		ssthresh: math.MaxUint64,
 	}
 }
 
-func (c *Cubic) OnSend(bytes float64) bool {
+func (c *Cubic) CanSend(bytes uint64) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.cwnd-c.inFlight >= bytes
+}
+
+func (c *Cubic) OnSend(bytes uint64) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.cwnd-c.inFlight >= bytes {
-		c.inFlight += bytes
-		return true
-	}
-	return false
+	c.inFlight += bytes
+	c.mu.Unlock()
 }
 
-func (c *Cubic) OnAck(bytes float64) {
+func (c *Cubic) OnAck(bytes uint64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -63,11 +65,11 @@ func (c *Cubic) OnAck(bytes float64) {
 
 	if c.epochStart.IsZero() {
 		c.epochStart = time.Now()
-		c.k = math.Cbrt(c.wMax * (1.0 - cubicBeta) / cubicC)
+		c.k = math.Cbrt(float64(c.wMax) * (1.0 - cubicBeta) / cubicC)
 	}
 
 	elapsed := time.Since(c.epochStart).Seconds()
-	cwnd := cubicC*math.Pow(elapsed-c.k, 3) + c.wMax
+	cwnd := uint64(cubicC*math.Pow(elapsed-c.k, 3) + float64(c.wMax))
 	if cwnd > c.cwnd {
 		c.cwnd = min(cwnd, maxWindow)
 	}
@@ -77,23 +79,17 @@ func (c *Cubic) OnLoss() {
 	c.mu.Lock()
 	c.inFlight = 0
 	c.wMax = c.cwnd
-	c.cwnd = max(c.cwnd*cubicBeta, minWindow)
+	c.cwnd = max(uint64(float64(c.cwnd)*cubicBeta), minWindow)
 	c.ssthresh = c.cwnd
 	c.epochStart = time.Time{}
-	c.k = math.Cbrt(c.wMax * (1.0 - cubicBeta) / cubicC)
+	c.k = math.Cbrt(float64(c.wMax) * (1.0 - cubicBeta) / cubicC)
 	c.mu.Unlock()
 }
 
-func (c *Cubic) Cwnd() float64 {
+func (c *Cubic) Cwnd() uint64 {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.cwnd
-}
-
-func (c *Cubic) InFlight() float64 {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.inFlight
 }
 
 func (c *Cubic) shouldIncreaseWindow() bool {
