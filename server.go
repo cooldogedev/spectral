@@ -14,10 +14,12 @@ type ServerConnection struct {
 }
 
 func newServerConnection(conn *internal.Conn, connectionID protocol.ConnectionID, ctx context.Context) *ServerConnection {
-	return &ServerConnection{
+	c := &ServerConnection{
 		connection:     newConnection(conn, connectionID, ctx),
 		streamRequests: make(chan *frame.StreamRequest, 100),
 	}
+	c.connection.handler = c.handle
+	return c
 }
 
 func (c *ServerConnection) AcceptStream(ctx context.Context) (*Stream, error) {
@@ -35,19 +37,6 @@ func (c *ServerConnection) AcceptStream(ctx context.Context) (*Stream, error) {
 		}
 		return stream, nil
 	}
-}
-
-func (c *ServerConnection) receive(sequenceID uint32, frames []frame.Frame) (err error) {
-	if c.receivedQueue.exists(sequenceID) {
-		return
-	}
-
-	for _, fr := range frames {
-		if err := c.handle(fr); err != nil {
-			return err
-		}
-	}
-	return c.connection.receive(sequenceID, frames)
 }
 
 func (c *ServerConnection) handle(fr frame.Frame) (err error) {

@@ -29,6 +29,13 @@ func (a *ackQueue) add(sequenceID uint32) {
 	a.mu.Unlock()
 }
 
+func (a *ackQueue) addDuplicate(sequenceID uint32) {
+	a.mu.Lock()
+	a.sort = true
+	a.list = append(a.list, sequenceID)
+	a.mu.Unlock()
+}
+
 func (a *ackQueue) flush() (delay int64, list []uint32) {
 	a.mu.Lock()
 	if len(a.list) > 0 {

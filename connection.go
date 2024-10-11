@@ -34,10 +34,11 @@ type connection struct {
 	cc             *congestion.Cubic
 	pacer          *congestion.Pacer
 	ack            *ackQueue
-	receivedQueue  *receiveQueue
+	receiveQueue   *receiveQueue
 	retransmission *retransmissionQueue
 	sendQueue      *sendQueue
 	streams        *streamMap
+	handler        func(frame.Frame) error
 	rtt            *internal.RTT
 	once           sync.Once
 	activity       atomic.Int64
@@ -53,7 +54,7 @@ func newConnection(conn *internal.Conn, connectionID protocol.ConnectionID, pare
 		cc:             congestion.NewCubic(),
 		pacer:          congestion.NewPacer(internal.DefaultRTT, 30),
 		ack:            newAckQueue(),
-		receivedQueue:  newReceiveQueue(),
+		receiveQueue:   newReceiveQueue(),
 		retransmission: newRetransmissionQueue(),
 		sendQueue:      newSendQueue(connectionID),
 		streams:        newStreamMap(),
@@ -158,7 +159,16 @@ func (c *connection) tick() {
 }
 
 func (c *connection) receive(sequenceID uint32, frames []frame.Frame) (err error) {
+	if c.receiveQueue.exists(sequenceID) {
+		c.ack.addDuplicate(sequenceID)
+		return
+	}
+
 	for _, fr := range frames {
+		if err := c.handler(fr); err != nil {
+			return err
+		}
+
 		if err := c.handle(fr); err != nil {
 			return err
 		}
@@ -166,7 +176,7 @@ func (c *connection) receive(sequenceID uint32, frames []frame.Frame) (err error
 
 	if sequenceID != 0 {
 		c.ack.add(sequenceID)
-		c.receivedQueue.store(sequenceID)
+		c.receiveQueue.store(sequenceID)
 	}
 	c.activity.Store(time.Now().UnixNano())
 	//lint:ignore SA6002 ignore this for now.
