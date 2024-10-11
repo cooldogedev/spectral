@@ -43,3 +43,5 @@ func (fr *ConnectionClose) Decode(p []byte) (int, error) {
 	fr.Message = string(p[5 : 5+messageLength])
 	return 5 + int(messageLength), nil
 }
+
+func (fr *ConnectionClose) Reset() {}

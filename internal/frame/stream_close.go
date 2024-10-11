@@ -28,3 +28,5 @@ func (fr *StreamClose) Decode(p []byte) (int, error) {
 	fr.StreamID = protocol.StreamID(binary.LittleEndian.Uint64(p[:8]))
 	return 8, nil
 }
+
+func (fr *StreamClose) Reset() {}

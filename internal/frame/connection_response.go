@@ -36,3 +36,5 @@ func (fr *ConnectionResponse) Decode(p []byte) (int, error) {
 	fr.Response = p[8]
 	return 9, nil
 }
+
+func (fr *ConnectionResponse) Reset() {}

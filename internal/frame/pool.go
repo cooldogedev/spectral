@@ -47,14 +47,12 @@ func GetFrame(id uint32) (Frame, error) {
 }
 
 func PutFrame(fr Frame) {
-	if fr, ok := fr.(ResettableFrame); ok {
-		fr.Reset()
-		switch fr.ID() {
-		case IDAcknowledgement:
-			acknowledgementPool.Put(fr)
-		case IDStreamData:
-			streamDataPool.Put(fr)
-		default:
-		}
+	fr.Reset()
+	switch fr.ID() {
+	case IDAcknowledgement:
+		acknowledgementPool.Put(fr)
+	case IDStreamData:
+		streamDataPool.Put(fr)
+	default:
 	}
 }
