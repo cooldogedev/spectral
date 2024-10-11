@@ -10,7 +10,7 @@ import (
 
 const (
 	initialWindow = protocol.MaxPacketSize * 32
-	maxWindow     = 1000000
+	maxWindow     = protocol.MaxPacketSize * 10000
 
 	cubicC    = 0.7
 	cubicBeta = 0.4
