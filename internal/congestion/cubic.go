@@ -10,6 +10,7 @@ import (
 
 const (
 	initialWindow = protocol.MaxPacketSize * 32
+	minWindow     = protocol.MaxPacketSize * 2
 	maxWindow     = protocol.MaxPacketSize * 10000
 
 	cubicC    = 0.7
@@ -69,7 +70,7 @@ func (c *Cubic) OnAck(bytes float64) {
 func (c *Cubic) OnLoss(bytes float64) {
 	c.mu.Lock()
 	c.wMax = c.cwnd
-	c.cwnd *= cubicBeta
+	c.cwnd = max(c.cwnd*cubicBeta, minWindow)
 	c.inFlight = max(c.inFlight-bytes, 0)
 	c.ssthresh = c.cwnd
 	c.epochStart = time.Time{}
