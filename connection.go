@@ -190,9 +190,9 @@ func (c *connection) handle(fr frame.Frame) (err error) {
 		for i, r := range fr.Ranges {
 			for j := r[0]; j <= r[1]; j++ {
 				if entry := c.retransmission.remove(j); entry != nil {
-					c.cc.OnAck(float64(len(entry.p)))
+					c.cc.OnAck(float64(len(entry.payload)))
 					if i == len(fr.Ranges)-1 && j == r[1] {
-						c.rtt.Add(time.Duration(time.Since(entry.t).Nanoseconds()-fr.Delay) * time.Nanosecond)
+						c.rtt.Add(time.Duration(time.Since(entry.timestamp).Nanoseconds()-fr.Delay) * time.Nanosecond)
 					}
 				}
 			}

@@ -5,12 +5,16 @@ import (
 	"time"
 )
 
-const retransmissionDelay = time.Second * 5
+const (
+	retransmissionAttempts = 3
+	retransmissionDelay    = time.Second * 3
+)
 
 type retransmissionEntry struct {
-	p    []byte
-	nack bool
-	t    time.Time
+	payload   []byte
+	timestamp time.Time
+	attempts  int
+	nack      bool
 }
 
 type retransmissionQueue struct {
@@ -26,7 +30,7 @@ func newRetransmissionQueue() *retransmissionQueue {
 
 func (r *retransmissionQueue) add(sequenceID uint32, p []byte) {
 	r.mu.Lock()
-	r.entries[sequenceID] = &retransmissionEntry{p: p, t: time.Now()}
+	r.entries[sequenceID] = &retransmissionEntry{payload: p, timestamp: time.Now()}
 	r.mu.Unlock()
 }
 
@@ -53,11 +57,16 @@ func (r *retransmissionQueue) shift() (p []byte) {
 	r.mu.Lock()
 	if len(r.entries) > 0 {
 		now := time.Now()
-		for _, entry := range r.entries {
-			if entry.nack || now.Sub(entry.t) >= retransmissionDelay {
+		for sequenceID, entry := range r.entries {
+			if entry.nack || now.Sub(entry.timestamp) >= retransmissionDelay {
+				entry.timestamp = now
 				entry.nack = false
-				entry.t = now
-				p = entry.p
+				entry.attempts++
+				if entry.attempts >= retransmissionAttempts {
+					delete(r.entries, sequenceID)
+				}
+				p = entry.payload
+				break
 			}
 		}
 	}
