@@ -15,8 +15,8 @@ const (
 	minWindow     = protocol.MaxPacketSize * 2
 	maxWindow     = protocol.MaxPacketSize * 10000
 
-	cubicBeta = 0.4
-	cubicC    = 0.7
+	cubicBeta = 0.7
+	cubicC    = 0.4
 )
 
 type Cubic struct {
