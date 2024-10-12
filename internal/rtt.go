@@ -6,8 +6,6 @@ import (
 )
 
 const (
-	DefaultRTT = time.Millisecond * 100
-
 	alpha         = 0.125
 	alphaMinusOne = 1.0 - alpha
 )

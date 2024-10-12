@@ -7,6 +7,8 @@ import (
 )
 
 const (
+	defaultRTT = time.Millisecond * 100
+
 	minPacingDelay = time.Millisecond * 2
 	minBurstSize   = 2
 	maxBurstSize   = 10
@@ -30,8 +32,8 @@ func (p *Pacer) Delay(rtt time.Duration, bytes uint64, window uint64) time.Durat
 		p.capacity = optimalCapacity(rtt, window)
 		p.tokens = min(p.tokens, p.capacity)
 		p.window = window
-		p.rate = 1.25 * float64(window) / max(rtt.Seconds(), 0.1)
 		p.rtt = rtt
+		p.rate = optimalRate(rtt, window)
 	}
 
 	if p.tokens >= bytes {
@@ -57,6 +59,13 @@ func optimalCapacity(rtt time.Duration, window uint64) uint64 {
 	rttNs := max(rtt.Nanoseconds(), 1)
 	capacity := (window * uint64(minPacingDelay.Nanoseconds())) / uint64(rttNs)
 	return clamp(capacity, minBurstSize*protocol.MaxPacketSize, maxBurstSize*protocol.MaxPacketSize)
+}
+
+func optimalRate(rtt time.Duration, window uint64) float64 {
+	if rtt == 0 {
+		rtt = defaultRTT
+	}
+	return 1.25 * float64(window) / rtt.Seconds()
 }
 
 func clamp(value, min, max uint64) uint64 {
