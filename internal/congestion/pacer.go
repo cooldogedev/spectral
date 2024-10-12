@@ -30,7 +30,7 @@ func (p *Pacer) Delay(rtt time.Duration, bytes uint64, window uint64) time.Durat
 		p.capacity = optimalCapacity(rtt, window)
 		p.tokens = min(p.tokens, p.capacity)
 		p.window = window
-		p.rate = 1.25 * float64(window) / max(rtt.Seconds(), 1)
+		p.rate = 1.25 * float64(window) / max(rtt.Seconds(), 0.1)
 		p.rtt = rtt
 	}
 
