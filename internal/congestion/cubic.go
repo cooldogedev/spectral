@@ -20,11 +20,13 @@ const (
 )
 
 type Cubic struct {
-	inFlight   uint64
+	awaiting   uint64
+	flight     uint64
 	cwnd       uint64
 	wMax       uint64
 	ssthresh   uint64
 	k          float64
+	ch         chan struct{}
 	epochStart time.Time
 	mu         sync.RWMutex
 }
@@ -34,18 +36,24 @@ func NewCubic() *Cubic {
 		cwnd:     initialWindow,
 		wMax:     initialWindow,
 		ssthresh: math.MaxUint64,
+		ch:       make(chan struct{}, 1),
 	}
 }
 
-func (c *Cubic) CanSend(bytes uint64) bool {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.cwnd-c.inFlight >= bytes
+func (c *Cubic) ScheduleSend(bytes uint64) chan struct{} {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.cwnd-c.flight >= bytes {
+		return nil
+	}
+	c.awaiting = bytes
+	return c.ch
 }
 
 func (c *Cubic) OnSend(bytes uint64) {
 	c.mu.Lock()
-	c.inFlight += bytes
+	c.awaiting = 0
+	c.flight += bytes
 	c.mu.Unlock()
 }
 
@@ -53,7 +61,11 @@ func (c *Cubic) OnAck(bytes uint64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	c.inFlight = max(c.inFlight-bytes, 0)
+	c.flight = max(c.flight-bytes, 0)
+	if c.awaiting != 0 && c.cwnd-c.flight >= c.awaiting {
+		c.ch <- struct{}{}
+	}
+
 	if !c.shouldIncreaseWindow() {
 		return
 	}
@@ -77,7 +89,10 @@ func (c *Cubic) OnAck(bytes uint64) {
 
 func (c *Cubic) OnLoss() {
 	c.mu.Lock()
-	c.inFlight = 0
+	c.flight = 0
+	if c.awaiting != 0 {
+		c.ch <- struct{}{}
+	}
 	c.wMax = c.cwnd
 	c.cwnd = max(uint64(float64(c.cwnd)*cubicBeta), minWindow)
 	c.ssthresh = c.cwnd
@@ -93,10 +108,10 @@ func (c *Cubic) Cwnd() uint64 {
 }
 
 func (c *Cubic) shouldIncreaseWindow() bool {
-	if c.inFlight >= c.cwnd {
+	if c.flight >= c.cwnd {
 		return true
 	}
-	availableBytes := c.cwnd - c.inFlight
-	slowStartLimited := c.ssthresh > c.cwnd && c.inFlight > c.cwnd/2
+	availableBytes := c.cwnd - c.flight
+	slowStartLimited := c.ssthresh > c.cwnd && c.flight > c.cwnd/2
 	return slowStartLimited || availableBytes <= maxBurstPackets*protocol.MaxPacketSize
 }

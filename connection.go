@@ -260,14 +260,13 @@ func (c *connection) acknowledge() (err error) {
 }
 
 func (c *connection) transmit() (err error) {
-	rtt := c.rtt.RTT()
 	sequenceID, pk := c.sendQueue.shift()
-	for !c.cc.CanSend(uint64(len(pk))) {
-		time.Sleep(rtt)
+	if d := c.pacer.Delay(c.rtt.RTT(), uint64(len(pk)), c.cc.Cwnd()); d > 0 {
+		time.Sleep(d)
 	}
 
-	if d := c.pacer.Delay(rtt, uint64(len(pk)), c.cc.Cwnd()); d > 0 {
-		time.Sleep(d)
+	if ch := c.cc.ScheduleSend(uint64(len(pk))); ch != nil {
+		<-ch
 	}
 
 	c.cc.OnSend(uint64(len(pk)))
