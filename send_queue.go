@@ -15,7 +15,7 @@ type sendQueue struct {
 	pk           []byte
 	list         [][]byte
 	cond         *sync.Cond
-	mu           sync.RWMutex
+	mu           sync.Mutex
 }
 
 func newSendQueue(connectionID protocol.ConnectionID) *sendQueue {
