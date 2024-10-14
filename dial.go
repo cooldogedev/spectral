@@ -5,10 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"time"
 
-	"github.com/cooldogedev/spectral/internal"
 	"github.com/cooldogedev/spectral/internal/frame"
-	"github.com/cooldogedev/spectral/internal/protocol"
 )
 
 func Dial(ctx context.Context, address string) (Connection, error) {
@@ -22,53 +21,49 @@ func Dial(ctx context.Context, address string) (Connection, error) {
 		return nil, err
 	}
 
-	if err := conn.SetReadBuffer(protocol.ReceiveBufferSize); err != nil {
+	uConn, err := newUDPConn(conn, false)
+	if err != nil {
 		_ = conn.Close()
 		return nil, err
 	}
 
-	if err := conn.SetWriteBuffer(protocol.SendBufferSize); err != nil {
-		_ = conn.Close()
-		return nil, err
-	}
-
-	c := newClientConnection(internal.NewConn(conn, addr, true), context.Background())
-	if err := c.write(&frame.ConnectionRequest{}); err != nil {
+	c := newClientConnection(uConn, addr, context.Background())
+	c.logger.Log("connection_request", "addr", address)
+	if err := c.writeControl(&frame.ConnectionRequest{}, true); err != nil {
 		_ = c.CloseWithError(frame.ConnectionCloseInternal, "failed to send connection request")
 		return nil, err
 	}
 
-	go func() {
-		defer c.CloseWithError(frame.ConnectionCloseInternal, "error while reading")
-		p := make([]byte, 1500)
-		for {
-			n, _, err := conn.ReadFromUDP(p)
-			if err != nil {
-				return
-			}
-
-			_, sequenceID, frames, err := frame.Unpack(p[:n])
-			if err != nil {
-				return
-			}
-
-			if err := c.receive(sequenceID, frames); err != nil {
-				return
-			}
+	go uConn.Read(func(dgram *datagram) (err error) {
+		defer dgram.reset()
+		_, sequenceID, frames, err := frame.Unpack(dgram.b)
+		if err != nil {
+			c.logger.Log("unpack_err", "err", err.Error())
+			return err
 		}
-	}()
 
+		select {
+		case <-c.ctx.Done():
+			return context.Cause(c.ctx)
+		default:
+			c.packets <- &receivedPacket{sequenceID, frames, time.Now()}
+			return
+		}
+	})
 	select {
 	case <-ctx.Done():
-		_ = c.CloseWithError(frame.ConnectionCloseInternal, fmt.Sprintf("dialer context: %v", ctx.Err().Error()))
-		return nil, ctx.Err()
+		c.logger.Log("connection_request_timeout")
+		_ = c.CloseWithError(frame.ConnectionCloseInternal, fmt.Sprintf("dialer context: %v", context.Cause(ctx).Error()))
+		return nil, context.Cause(ctx)
 	case response := <-c.response:
 		if response.Response == frame.ConnectionResponseFailed {
+			c.logger.Log("connection_request_fail")
 			_ = c.CloseWithError(frame.ConnectionCloseInternal, "failed to open connection")
 			return nil, errors.New("failed to open connection")
 		}
-		c.connectionID = response.ConnectionID
-		c.sendQueue.connectionID = response.ConnectionID
+		c.connectionID.Store(int64(response.ConnectionID))
+		c.logger.SetConnectionID(response.ConnectionID)
+		c.logger.Log("connection_request_success")
 		return c, nil
 	}
 }

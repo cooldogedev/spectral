@@ -21,11 +21,11 @@ func (fr *ConnectionResponse) ID() uint32 {
 	return IDConnectionResponse
 }
 
-func (fr *ConnectionResponse) Encode() ([]byte, error) {
+func (fr *ConnectionResponse) Encode() []byte {
 	p := make([]byte, 9)
 	binary.LittleEndian.PutUint64(p[0:8], uint64(fr.ConnectionID))
 	p[8] = fr.Response
-	return p, nil
+	return p
 }
 
 func (fr *ConnectionResponse) Decode(p []byte) (int, error) {

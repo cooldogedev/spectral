@@ -8,14 +8,10 @@ import (
 	"github.com/cooldogedev/spectral/internal/protocol"
 )
 
-func PackSingle(fr Frame) ([]byte, error) {
-	p, err := fr.Encode()
-	if err != nil {
-		return nil, err
-	}
+func PackSingle(fr Frame) []byte {
 	id := make([]byte, 4)
 	binary.LittleEndian.PutUint32(id, fr.ID())
-	return append(id, p...), nil
+	return append(id, fr.Encode()...)
 }
 
 func Pack(connectionID protocol.ConnectionID, sequenceID uint32, total uint32, frames []byte) []byte {

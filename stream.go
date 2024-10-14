@@ -2,94 +2,82 @@ package spectral
 
 import (
 	"context"
-	"io"
+	"errors"
 	"slices"
 	"sync"
+	"sync/atomic"
 
+	"github.com/cooldogedev/spectral/internal"
 	"github.com/cooldogedev/spectral/internal/frame"
+	"github.com/cooldogedev/spectral/internal/log"
 	"github.com/cooldogedev/spectral/internal/protocol"
 )
 
-const maxPayloadSize = 128
-
-type splitEntry struct {
-	fragments [][]byte
-	remaining int
-}
+var streamDataPool = sync.Pool{New: func() any { return &frame.StreamData{} }}
 
 type Stream struct {
-	conn               *connection
-	ctx                context.Context
-	cancelFunc         context.CancelFunc
-	streamID           protocol.StreamID
-	expectedSequenceID uint32
-	sequenceID         uint32
-	splits             map[uint32]*splitEntry
-	ordered            map[uint32][]byte
-	buf                []byte
-	mu                 sync.Mutex
-	cond               *sync.Cond
-	once               sync.Once
+	ctx        context.Context
+	cancelFunc context.CancelCauseFunc
+	streamID   protocol.StreamID
+	wake       func()
+	closer     func()
+	sendQueue  *sendQueue
+	frame      *frameQueue
+	buffer     *internal.RingBuffer[byte]
+	available  chan struct{}
+	sequenceID atomic.Uint32
+	logger     log.Logger
+	mu         sync.Mutex
+	once       sync.Once
 }
 
-func newStream(conn *connection, streamID protocol.StreamID) *Stream {
-	ctx, cancelFunc := context.WithCancel(conn.Context())
-	s := &Stream{
-		conn:       conn,
+func newStream(streamID protocol.StreamID, parentCtx context.Context, sendQueue *sendQueue, wake func(), closer func(), logger log.Logger) *Stream {
+	ctx, cancelFunc := context.WithCancelCause(parentCtx)
+	return &Stream{
 		ctx:        ctx,
 		cancelFunc: cancelFunc,
 		streamID:   streamID,
-		splits:     make(map[uint32]*splitEntry),
-		ordered:    make(map[uint32][]byte),
-		buf:        make([]byte, 0, 1024*1024),
+		wake:       wake,
+		closer:     closer,
+		sendQueue:  sendQueue,
+		frame:      newFrameQueue(),
+		buffer:     internal.NewRingBuffer[byte](1024 * 1024),
+		available:  make(chan struct{}, 1),
+		logger:     logger,
 	}
-	s.cond = sync.NewCond(&s.mu)
-	return s
 }
 
 func (s *Stream) Read(p []byte) (int, error) {
+	if n := s.read(p); n > 0 {
+		return n, nil
+	}
+
 	select {
 	case <-s.ctx.Done():
-		return 0, s.ctx.Err()
-	default:
+		return 0, context.Cause(s.ctx)
+	case <-s.available:
+		return s.read(p), nil
 	}
-
-	s.mu.Lock()
-	for len(s.buf) == 0 && s.buf != nil {
-		s.cond.Wait()
-	}
-
-	if s.buf == nil {
-		s.mu.Unlock()
-		return 0, io.EOF
-	}
-
-	n := copy(p, s.buf)
-	s.buf = s.buf[n:]
-	s.mu.Unlock()
-	return n, nil
 }
 
 func (s *Stream) Write(p []byte) (int, error) {
 	select {
 	case <-s.ctx.Done():
-		return 0, s.ctx.Err()
+		return 0, context.Cause(s.ctx)
 	default:
 	}
 
-	fr := &frame.StreamData{
-		StreamID:   s.streamID,
-		SequenceID: s.sequenceID,
+	mss := int(s.sendQueue.mss()) - 20
+	fr := streamDataPool.Get().(*frame.StreamData)
+	fr.StreamID = s.streamID
+	for payload := range slices.Chunk(p, mss) {
+		fr.SequenceID = s.sequenceID.Add(1) - 1
+		fr.Payload = payload
+		s.sendQueue.add(frame.PackSingle(fr))
 	}
-	if len(p) <= maxPayloadSize {
-		fr.Payload = p
-		if err := s.conn.write(fr); err != nil {
-			return 0, err
-		}
-	} else if err := s.writeSplit(p, fr); err != nil {
-		return 0, err
-	}
-	s.sequenceID++
+	fr.Payload = fr.Payload[:0]
+	streamDataPool.Put(fr)
+	s.wake()
 	return len(p), nil
 }
 
@@ -98,107 +86,72 @@ func (s *Stream) Context() context.Context {
 }
 
 func (s *Stream) Close() error {
-	_ = s.conn.write(&frame.StreamClose{StreamID: s.streamID})
-	return s.internalClose()
+	s.logger.Log("stream_close_application", "streamID", s.streamID)
+	return s.internalClose("closed by application")
 }
 
-func (s *Stream) writeSplit(p []byte, fr *frame.StreamData) error {
-	length := len(p)
-	fr.Total = uint32((length + maxPayloadSize - 1) / maxPayloadSize)
-	for i := 0; i < int(fr.Total); i++ {
-		start := i * maxPayloadSize
-		end := start + maxPayloadSize
-		if end > length {
-			end = length
-		}
-
-		fr.Payload = p[start:end]
-		fr.Offset = uint32(i)
-		if err := s.conn.write(fr); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (s *Stream) internalClose() error {
+func (s *Stream) internalClose(message string) error {
 	s.once.Do(func() {
-		s.mu.Lock()
-		s.buf = s.buf[:0]
-		s.buf = nil
-		s.mu.Unlock()
-		s.cond.Signal()
-		s.cancelFunc()
-		s.conn.streams.remove(s.streamID)
+		s.cancelFunc(errors.New(message))
+		s.closer()
+		s.logger.Log("stream_close", "streamID", s.streamID)
+		s.cleanup()
 	})
 	return nil
 }
 
-func (s *Stream) receive(fr *frame.StreamData) {
-	if fr.Total <= 0 {
-		s.handleSingle(fr.SequenceID, fr.Payload)
-		return
-	}
-
-	entry, ok := s.splits[fr.SequenceID]
-	if !ok {
-		entry = &splitEntry{
-			fragments: make([][]byte, fr.Total),
-			remaining: int(fr.Total),
-		}
-		s.splits[fr.SequenceID] = entry
-	}
-	entry.fragments[fr.Offset] = append([]byte(nil), fr.Payload...)
-	entry.remaining--
-	if entry.remaining == 0 {
-		delete(s.splits, fr.SequenceID)
-		s.handleSplit(fr.SequenceID, entry.fragments)
-	}
-}
-
-func (s *Stream) handleSingle(sequenceID uint32, p []byte) {
-	if sequenceID != s.expectedSequenceID {
-		s.ordered[sequenceID] = append([]byte(nil), p...)
-		return
-	}
-
-	s.expectedSequenceID++
+func (s *Stream) cleanup() {
+	<-s.ctx.Done()
 	s.mu.Lock()
-	if len(s.ordered) > 0 {
-		s.order()
-	}
-	s.buf = append(s.buf, p...)
+	s.buffer.Reset()
+	s.frame.clear()
 	s.mu.Unlock()
-	s.cond.Signal()
 }
 
-func (s *Stream) handleSplit(sequenceID uint32, fragments [][]byte) {
-	if sequenceID != s.expectedSequenceID {
-		s.ordered[sequenceID] = slices.Concat(fragments...)
+func (s *Stream) receive(sequenceID uint32, p []byte) {
+	select {
+	case <-s.ctx.Done():
 		return
+	default:
 	}
 
-	s.expectedSequenceID++
 	s.mu.Lock()
-	if len(s.ordered) > 0 {
-		s.order()
+	if s.frame.expected == sequenceID && s.buffer.Free() >= len(p) {
+		s.frame.expected++
+		_, _ = s.buffer.Write(p)
+	} else {
+		s.frame.enqueue(sequenceID, p)
 	}
-
-	for _, fragment := range fragments {
-		s.buf = append(s.buf, fragment...)
-	}
+	s.processFrames()
 	s.mu.Unlock()
-	s.cond.Signal()
 }
 
-func (s *Stream) order() {
+func (s *Stream) processFrames() {
 	for {
-		p, ok := s.ordered[s.expectedSequenceID]
-		if !ok {
+		entry := s.frame.top()
+		if entry == nil || len(entry.payload) > s.buffer.Free() {
 			break
 		}
-		delete(s.ordered, s.expectedSequenceID)
-		s.expectedSequenceID++
-		s.buf = append(s.buf, p...)
+
+		if _, err := s.buffer.Write(entry.payload); err != nil {
+			break
+		}
+		s.frame.dequeue()
 	}
+
+	if s.buffer.Len() > 0 {
+		select {
+		case s.available <- struct{}{}:
+		default:
+		}
+	}
+}
+
+func (s *Stream) read(p []byte) (n int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.buffer.Len() > 0 {
+		return s.buffer.Read(p)
+	}
+	return
 }

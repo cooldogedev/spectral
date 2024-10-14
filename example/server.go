@@ -33,12 +33,8 @@ func main() {
 	}
 
 	log.Printf("Received: %s", string(buf[:n]))
-	_, err = stream.Write(buf[:n])
-	if err != nil {
+	if _, err = stream.Write(buf[:n]); err != nil {
 		log.Fatal(err)
 	}
-	log.Printf("Sent: %s", string(buf[:n]))
-	select {
-	case <-conn.Context().Done():
-	}
+	<-conn.Context().Done()
 }

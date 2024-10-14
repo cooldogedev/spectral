@@ -15,10 +15,10 @@ func (fr *StreamRequest) ID() uint32 {
 	return IDStreamRequest
 }
 
-func (fr *StreamRequest) Encode() ([]byte, error) {
+func (fr *StreamRequest) Encode() []byte {
 	p := make([]byte, 8)
 	binary.LittleEndian.PutUint64(p, uint64(fr.StreamID))
-	return p, nil
+	return p
 }
 
 func (fr *StreamRequest) Decode(p []byte) (int, error) {

@@ -21,13 +21,13 @@ func (fr *ConnectionClose) ID() uint32 {
 	return IDConnectionClose
 }
 
-func (fr *ConnectionClose) Encode() ([]byte, error) {
+func (fr *ConnectionClose) Encode() []byte {
 	messageLength := uint32(len(fr.Message))
 	p := make([]byte, 1+4+messageLength)
 	p[0] = fr.Code
 	binary.LittleEndian.PutUint32(p[1:5], messageLength)
 	copy(p[5:], fr.Message)
-	return p, nil
+	return p
 }
 
 func (fr *ConnectionClose) Decode(p []byte) (int, error) {

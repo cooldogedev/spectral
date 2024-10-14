@@ -11,4 +11,7 @@ const (
 	IDStreamResponse
 	IDStreamData
 	IDStreamClose
+
+	IDMTURequest
+	IDMTUResponse
 )

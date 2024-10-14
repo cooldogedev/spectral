@@ -25,11 +25,9 @@ func main() {
 	defer stream.Close()
 
 	message := "Hello, World!"
-	_, err = stream.Write([]byte(message))
-	if err != nil {
+	if _, err = stream.Write([]byte(message)); err != nil {
 		log.Fatal(err)
 	}
-	log.Printf("Sent: %s", message)
 
 	buf := make([]byte, 1024)
 	n, err := stream.Read(buf)
@@ -37,7 +35,5 @@ func main() {
 		log.Fatal(err)
 	}
 	log.Printf("Received echo: %s", string(buf[:n]))
-	select {
-	case <-conn.Context().Done():
-	}
+	<-conn.Context().Done()
 }

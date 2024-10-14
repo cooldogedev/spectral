@@ -1,53 +1,50 @@
 package spectral
 
 import (
-	"slices"
-	"sync"
 	"time"
+
+	"github.com/cooldogedev/spectral/internal/protocol"
 )
 
 type ackQueue struct {
-	sequenceID uint32
-	sort       bool
-	lastAck    time.Time
-	list       []uint32
-	mu         sync.Mutex
+	queue   []uint32
+	max     uint32
+	maxTime time.Time
+	nextAck time.Time
 }
 
 func newAckQueue() *ackQueue {
 	return &ackQueue{}
 }
 
-func (a *ackQueue) add(sequenceID uint32) {
-	a.mu.Lock()
-	a.sequenceID++
-	if !a.sort && sequenceID != a.sequenceID {
-		a.sort = true
+func (a *ackQueue) add(now time.Time, sequenceID uint32) {
+	a.queue = append(a.queue, sequenceID)
+	if sequenceID > a.max {
+		a.max = sequenceID
+		a.maxTime = now
 	}
-	a.lastAck = time.Now()
-	a.list = append(a.list, sequenceID)
-	a.mu.Unlock()
+
+	if a.nextAck.IsZero() {
+		a.nextAck = now.Add(protocol.MaxAckDelay - protocol.TimerGranularity)
+	}
 }
 
-func (a *ackQueue) addDuplicate(sequenceID uint32) {
-	a.mu.Lock()
-	a.sort = true
-	a.list = append(a.list, sequenceID)
-	a.mu.Unlock()
+func (a *ackQueue) next() (t time.Time) {
+	return a.nextAck
 }
 
-func (a *ackQueue) flush() (delay int64, list []uint32) {
-	a.mu.Lock()
-	if len(a.list) > 0 {
-		delay = time.Since(a.lastAck).Nanoseconds()
-		list = a.list
-		if a.sort {
-			slices.Sort(list)
+func (a *ackQueue) flush(now time.Time) (list []uint32, maxSequenceID uint32, delay time.Duration) {
+	if len(a.queue) > 0 && now.After(a.nextAck) {
+		list = a.queue
+		maxSequenceID = a.max
+		delay = now.Sub(a.maxTime)
+		if delay < 0 {
+			delay = 0
 		}
-		a.sort = false
-		a.lastAck = time.Time{}
-		a.list = a.list[:0]
+		a.queue = a.queue[:0]
+		a.max = 0
+		a.maxTime = time.Time{}
+		a.nextAck = time.Time{}
 	}
-	a.mu.Unlock()
 	return
 }

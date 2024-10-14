@@ -21,11 +21,11 @@ func (fr *StreamResponse) ID() uint32 {
 	return IDStreamResponse
 }
 
-func (fr *StreamResponse) Encode() ([]byte, error) {
+func (fr *StreamResponse) Encode() []byte {
 	p := make([]byte, 9)
 	binary.LittleEndian.PutUint64(p[0:8], uint64(fr.StreamID))
 	p[8] = fr.Response
-	return p, nil
+	return p
 }
 
 func (fr *StreamResponse) Decode(p []byte) (int, error) {

@@ -8,12 +8,12 @@ import (
 var (
 	acknowledgementPool = sync.Pool{
 		New: func() any {
-			return &Acknowledgement{Ranges: make([]AcknowledgementRange, 0, 16)}
+			return &Acknowledgement{Ranges: make([]AcknowledgementRange, 0, 128)}
 		},
 	}
 	streamDataPool = sync.Pool{
 		New: func() any {
-			return &StreamData{Payload: make([]byte, 0, 128)}
+			return &StreamData{Payload: make([]byte, 0, 1452)}
 		},
 	}
 	Pool = sync.Pool{
@@ -41,6 +41,10 @@ func GetFrame(id uint32) (Frame, error) {
 		return &StreamRequest{}, nil
 	case IDStreamResponse:
 		return &StreamResponse{}, nil
+	case IDMTURequest:
+		return &MTURequest{}, nil
+	case IDMTUResponse:
+		return &MTUResponse{}, nil
 	default:
 		return nil, fmt.Errorf("unknown frame: %v", id)
 	}

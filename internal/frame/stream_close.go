@@ -15,10 +15,10 @@ func (fr *StreamClose) ID() uint32 {
 	return IDStreamClose
 }
 
-func (fr *StreamClose) Encode() ([]byte, error) {
+func (fr *StreamClose) Encode() []byte {
 	p := make([]byte, 8)
 	binary.LittleEndian.PutUint64(p, uint64(fr.StreamID))
-	return p, nil
+	return p
 }
 
 func (fr *StreamClose) Decode(p []byte) (int, error) {

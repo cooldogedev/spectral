@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"net"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -12,10 +14,21 @@ import (
 	"github.com/cooldogedev/spectral/internal"
 	"github.com/cooldogedev/spectral/internal/congestion"
 	"github.com/cooldogedev/spectral/internal/frame"
+	"github.com/cooldogedev/spectral/internal/log"
 	"github.com/cooldogedev/spectral/internal/protocol"
 )
 
-const inactivityTimeout = time.Second * 30
+const (
+	deadlineInf       = time.Duration(math.MaxInt64)
+	deadlineImmediate = protocol.TimerGranularity
+	inactivityTimeout = time.Second * 30
+)
+
+type receivedPacket struct {
+	sequenceID uint32
+	frames     []frame.Frame
+	t          time.Time
+}
 
 type Connection interface {
 	AcceptStream(ctx context.Context) (*Stream, error)
@@ -27,41 +40,62 @@ type Connection interface {
 var _ Connection = &connection{}
 
 type connection struct {
-	conn           *internal.Conn
-	connectionID   protocol.ConnectionID
+	conn           *udpConn
+	peerAddr       *net.UDPAddr
+	connectionID   atomic.Int64
+	sequenceID     atomic.Uint32
 	ctx            context.Context
 	cancelFunc     context.CancelCauseFunc
-	cc             *congestion.Cubic
+	sender         *congestion.Sender
 	pacer          *congestion.Pacer
+	packets        chan *receivedPacket
 	ack            *ackQueue
 	receiveQueue   *receiveQueue
 	retransmission *retransmissionQueue
 	sendQueue      *sendQueue
 	streams        *streamMap
-	handler        func(frame.Frame) error
+	discovery      *mtuDiscovery
 	rtt            *internal.RTT
+	handler        func(frame.Frame) error
+	notify         chan struct{}
+	idle           time.Time
+	pacingDeadline time.Time
 	once           sync.Once
-	activity       atomic.Int64
+	logger         log.Logger
+	mss            uint64
 }
 
-func newConnection(conn *internal.Conn, connectionID protocol.ConnectionID, parentCtx context.Context) *connection {
+func newConnection(conn *udpConn, peerAddr *net.UDPAddr, connectionID protocol.ConnectionID, parentCtx context.Context, perspective log.Perspective) *connection {
+	now := time.Now()
+	logger := log.NewLogger(perspective)
 	ctx, cancelFunc := context.WithCancelCause(parentCtx)
 	c := &connection{
 		conn:           conn,
-		connectionID:   connectionID,
+		peerAddr:       peerAddr,
 		ctx:            ctx,
 		cancelFunc:     cancelFunc,
-		cc:             congestion.NewCubic(),
-		pacer:          congestion.NewPacer(),
+		sender:         congestion.NewRenoSender(logger, now, mtuMin),
+		pacer:          congestion.NewPacer(now),
+		packets:        make(chan *receivedPacket, 512),
 		ack:            newAckQueue(),
 		receiveQueue:   newReceiveQueue(),
 		retransmission: newRetransmissionQueue(),
-		sendQueue:      newSendQueue(connectionID),
+		sendQueue:      newSendQueue(),
 		streams:        newStreamMap(),
+		notify:         make(chan struct{}, 1),
+		idle:           now.Add(inactivityTimeout),
 		rtt:            internal.NewRTT(),
+		logger:         logger,
+		mss:            mtuMin,
 	}
-	go c.pace()
-	go c.tick()
+	c.connectionID.Store(int64(connectionID))
+	c.discovery = newMTUDiscovery(now, func(mtu uint64) {
+		c.logger.Log("mtu_update", "old", c.mss, "new", mtu)
+		c.mss = mtu
+		c.sender.SetMSS(mtu)
+		c.sendQueue.setMSS(mtu)
+	})
+	go c.run(now)
 	return c
 }
 
@@ -78,40 +112,42 @@ func (c *connection) LocalAddr() net.Addr {
 }
 
 func (c *connection) RemoteAddr() net.Addr {
-	return c.conn.RemoteAddr()
+	return c.peerAddr
 }
 
 func (c *connection) CloseWithError(code byte, message string) (err error) {
-	_ = c.write(&frame.ConnectionClose{Code: code, Message: message})
-	return c.internalClose(message)
+	_ = c.writeControl(&frame.ConnectionClose{Code: code, Message: message}, true)
+	c.logger.Log("connection_close_err", "code", code, "message", message)
+	return c.close(message)
 }
 
 func (c *connection) Context() context.Context {
 	return c.ctx
 }
 
-func (c *connection) internalClose(message string) (err error) {
-	c.once.Do(func() {
-		for _, stream := range c.streams.all() {
-			_ = stream.internalClose()
-		}
-		c.cancelFunc(errors.New(message))
-		_ = c.conn.Close()
-	})
-	return
-}
-
 func (c *connection) createStream(streamID protocol.StreamID) (*Stream, error) {
 	if c.streams.get(streamID) != nil {
+		c.logger.Log("duplicate_stream", "streamID", streamID)
 		return nil, fmt.Errorf("stream %v already exists", streamID)
 	}
-	stream := newStream(c, streamID)
+	stream := newStream(streamID, c.ctx, c.sendQueue, c.wake, func() {
+		_ = c.writeControl(&frame.StreamClose{StreamID: streamID}, true)
+		c.streams.remove(streamID)
+	}, c.logger)
 	c.streams.add(stream)
 	return stream, nil
 }
 
-func (c *connection) pace() {
-	defer c.CloseWithError(frame.ConnectionCloseInternal, "")
+func (c *connection) run(now time.Time) {
+	var lastDeadline time.Time
+	timer := time.NewTimer(deadlineInf)
+	defer func() {
+		timer.Stop()
+		_ = c.CloseWithError(frame.ConnectionCloseInternal, "")
+		c.cleanup()
+	}()
+
+runLoop:
 	for {
 		select {
 		case <-c.ctx.Done():
@@ -119,49 +155,85 @@ func (c *connection) pace() {
 		default:
 		}
 
-		c.sendQueue.mu.Lock()
-		if len(c.sendQueue.list) == 0 {
-			c.sendQueue.cond.Wait()
+		if err := c.maybeSend(now); err != nil {
+			break runLoop
 		}
 
-		c.sendQueue.mu.Unlock()
-		if err := c.transmit(); err != nil {
-			return
+		nextDeadline := firstTime(
+			c.idle,
+			c.ack.next(),
+			c.retransmission.next(c.rtt.RTO()),
+			c.pacingDeadline,
+		)
+		if !nextDeadline.IsZero() && nextDeadline.Before(now) {
+			now = time.Now()
+			if err := c.triggerTimer(now); err != nil {
+				break runLoop
+			}
+			continue
+		} else if !nextDeadline.IsZero() && !nextDeadline.Equal(lastDeadline) {
+			timer.Reset(nextDeadline.Sub(now))
+			lastDeadline = nextDeadline
 		}
-	}
-}
 
-func (c *connection) tick() {
-	ticker := time.NewTicker(time.Millisecond * 80)
-	defer func() {
-		ticker.Stop()
-		_ = c.CloseWithError(frame.ConnectionCloseInternal, "")
-	}()
-	for {
 		select {
 		case <-c.ctx.Done():
 			return
-		case <-ticker.C:
-			if err := c.acknowledge(); err != nil {
-				return
+		case first := <-c.packets:
+			now = time.Now()
+			c.idle = now.Add(inactivityTimeout)
+			if err := c.receive(now, first.t, first.sequenceID, first.frames); err != nil {
+				break runLoop
 			}
 
-			if err := c.retransmit(); err != nil {
-				return
-			}
+			totalPackets := len(c.packets)
+		receiveLoop:
+			for i := 0; i < totalPackets; i++ {
+				select {
+				case pk := <-c.packets:
+					if err := c.receive(now, pk.t, pk.sequenceID, pk.frames); err != nil {
+						break runLoop
+					}
 
-			if time.Since(time.Unix(0, c.activity.Load())) >= inactivityTimeout {
-				_ = c.CloseWithError(frame.ConnectionCloseTimeout, "network inactivity")
-				return
+					select {
+					case <-c.ctx.Done():
+						break runLoop
+					default:
+					}
+				default:
+					break receiveLoop
+				}
 			}
+		case <-timer.C:
+			now = time.Now()
+			if err := c.triggerTimer(now); err != nil {
+				break runLoop
+			}
+		case <-c.notify:
+			now = time.Now()
 		}
 	}
 }
 
-func (c *connection) receive(sequenceID uint32, frames []frame.Frame) (err error) {
-	if c.receiveQueue.exists(sequenceID) {
-		c.ack.addDuplicate(sequenceID)
-		return
+func (c *connection) triggerTimer(now time.Time) (err error) {
+	if !c.idle.After(now) {
+		_ = c.CloseWithError(frame.ConnectionCloseTimeout, "network inactivity")
+		return errors.New("network inactivity")
+	}
+
+	if err := c.retransmit(now); err != nil {
+		return err
+	}
+	return
+}
+
+func (c *connection) receive(now, t time.Time, sequenceID uint32, frames []frame.Frame) (err error) {
+	if sequenceID != 0 {
+		c.ack.add(t, sequenceID)
+		if !c.receiveQueue.add(sequenceID) {
+			c.logger.Log("duplicate_receive", "sequenceID", sequenceID)
+			return
+		}
 	}
 
 	for _, fr := range frames {
@@ -169,122 +241,198 @@ func (c *connection) receive(sequenceID uint32, frames []frame.Frame) (err error
 			return err
 		}
 
-		if err := c.handle(fr); err != nil {
+		if err := c.handle(now, fr); err != nil {
 			return err
 		}
 	}
-
-	if sequenceID != 0 {
-		c.ack.add(sequenceID)
-		c.receiveQueue.store(sequenceID)
-	}
-	c.activity.Store(time.Now().UnixNano())
 	//lint:ignore SA6002 ignore this for now.
 	frame.Pool.Put(frames[:0])
 	return
 }
 
-func (c *connection) handle(fr frame.Frame) (err error) {
+func (c *connection) handle(now time.Time, fr frame.Frame) (err error) {
 	switch fr := fr.(type) {
 	case *frame.Acknowledgement:
-		var ackBytes uint64
-		for i, r := range fr.Ranges {
-			for j := r[0]; j <= r[1]; j++ {
-				if entry := c.retransmission.remove(j); entry != nil {
-					ackBytes += uint64(len(entry.payload))
-					if i == len(fr.Ranges)-1 && j == r[1] {
-						c.rtt.Add(time.Duration(time.Since(entry.timestamp).Nanoseconds()-fr.Delay) * time.Nanosecond)
+		for _, r := range fr.Ranges {
+			for i := r[0]; i <= r[1]; i++ {
+				if entry := c.retransmission.remove(i); entry != nil {
+					c.sender.OnAck(now, entry.sent, c.rtt.SRTT(), uint64(len(entry.payload)))
+					if i == fr.Max {
+						c.rtt.Add(time.Since(entry.sent), time.Duration(fr.Delay))
 					}
 				}
 			}
 		}
-
-		if ackBytes > 0 {
-			c.cc.OnAck(ackBytes)
-		}
-
-		if fr.Type == frame.AcknowledgementWithGaps {
-			for _, sequenceID := range frame.GenerateAcknowledgementGaps(fr.Ranges) {
-				c.retransmission.nack(sequenceID)
-			}
-		}
 	case *frame.ConnectionClose:
-		if err := c.internalClose(fr.Message); err != nil {
+		if err := c.close(fr.Message); err != nil {
 			return err
 		}
 	case *frame.StreamData:
 		if stream := c.streams.get(fr.StreamID); stream != nil {
-			stream.receive(fr)
+			stream.receive(fr.SequenceID, fr.Payload)
 		}
 	case *frame.StreamClose:
 		if stream := c.streams.get(fr.StreamID); stream != nil {
-			_ = stream.internalClose()
+			c.logger.Log("stream_close_request", "streamID", fr.StreamID)
+			_ = stream.internalClose("closed by peer")
 		}
+	case *frame.MTURequest:
+		if err := c.writeControl(&frame.MTUResponse{MTU: fr.MTU}, false); err != nil {
+			return err
+		}
+	case *frame.MTUResponse:
+		c.discovery.onAck(fr.MTU)
 	}
 	frame.PutFrame(fr)
 	return
 }
 
-func (c *connection) write(fr frame.Frame) (err error) {
-	p, err := frame.PackSingle(fr)
-	if err != nil {
+func (c *connection) writeControl(fr frame.Frame, needsAck bool) (err error) {
+	select {
+	case <-c.ctx.Done():
+		return context.Cause(c.ctx)
+	default:
+	}
+
+	var sequenceID uint32
+	if needsAck {
+		sequenceID = c.sequenceID.Add(1)
+	}
+
+	pk := frame.Pack(protocol.ConnectionID(c.connectionID.Load()), sequenceID, 1, frame.PackSingle(fr))
+	if _, err := c.writeDatagram(pk); err != nil {
 		return err
 	}
-	c.sendQueue.add(p)
+
+	if needsAck {
+		c.retransmission.add(time.Now(), sequenceID, pk)
+	}
 	return
 }
 
-func (c *connection) writeImmediately(fr frame.Frame) (err error) {
-	pk, err := frame.PackSingle(fr)
-	if err != nil {
-		return err
+func (c *connection) maybeSend(now time.Time) (err error) {
+	if c.conn.mtud && !c.discovery.discovered && c.discovery.sendProbe(now, c.rtt.SRTT()) {
+		c.logger.Log("mtu_probe", "old", c.mss, "new", c.discovery.current)
+		_ = c.writeControl(&frame.MTURequest{MTU: c.discovery.current}, false)
 	}
 
-	if _, err := c.conn.Write(frame.Pack(c.connectionID, 0, 1, pk)); err != nil {
-		return err
+	for c.sendQueue.available() {
+		wouldBlock, err := c.transmit(now)
+		if err != nil {
+			return err
+		}
+
+		if wouldBlock {
+			break
+		}
+	}
+
+	if !c.sendQueue.available() {
+		c.pacingDeadline = time.Time{}
+	} else if c.pacingDeadline.IsZero() || now.After(c.pacingDeadline) {
+		c.pacingDeadline = now.Add(deadlineImmediate)
+	}
+	return c.acknowledge(now)
+}
+
+func (c *connection) transmit(now time.Time) (wouldBlock bool, err error) {
+	total, p := c.sendQueue.pack(c.sender.Available())
+	if total == 0 {
+		c.logger.Log("congestion_blocked")
+		return true, nil
+	}
+
+	length := uint64(len(p))
+	if d := c.pacer.Delay(now, c.rtt.SRTT(), length, c.mss, c.sender.Window()); !d.IsZero() && d.After(now) {
+		c.pacingDeadline = d
+		c.logger.Log("pacer_block", "len", length, "delay", now.Sub(d).Nanoseconds())
+		return true, nil
+	}
+
+	sequenceID := c.sequenceID.Add(1)
+	pk := frame.Pack(protocol.ConnectionID(c.connectionID.Load()), sequenceID, total, p)
+	c.sendQueue.flush()
+	if _, err := c.writeDatagram(pk); err != nil {
+		return false, err
+	}
+	c.sender.OnSend(length)
+	c.pacer.OnSend(length)
+	c.retransmission.add(now, sequenceID, pk)
+	return
+}
+
+func (c *connection) acknowledge(now time.Time) (err error) {
+	list, maxSequenceID, delay := c.ack.flush(now)
+	if len(list) > 0 {
+		fr := &frame.Acknowledgement{Delay: delay.Nanoseconds(), Max: maxSequenceID}
+		ranges := frame.GenerateAcknowledgementRanges(list)
+		for chunk := range slices.Chunk(ranges, 128) {
+			fr.Ranges = chunk
+			if err := c.writeControl(fr, false); err != nil {
+				return err
+			}
+		}
 	}
 	return
 }
 
-func (c *connection) acknowledge() (err error) {
-	delay, list := c.ack.flush()
-	if list == nil {
-		return
-	}
-	ackType, ranges := frame.GenerateAcknowledgementRange(list)
-	return c.writeImmediately(&frame.Acknowledgement{
-		Type:   ackType,
-		Delay:  delay,
-		Ranges: ranges,
-	})
-}
-
-func (c *connection) transmit() (err error) {
-	sequenceID, pk := c.sendQueue.shift()
-	if d := c.pacer.Delay(c.rtt.RTT(), uint64(len(pk)), c.cc.Cwnd()); d > 0 {
-		time.Sleep(d)
-	}
-
-	if ch := c.cc.ScheduleSend(uint64(len(pk))); ch != nil {
-		<-ch
-	}
-
-	c.cc.OnSend(uint64(len(pk)))
-	c.pacer.OnSend(uint64(len(pk)))
-	c.retransmission.add(sequenceID, pk)
-	if _, err := c.conn.Write(pk); err != nil {
-		return err
-	}
-	c.activity.Store(time.Now().UnixNano())
-	return
-}
-
-func (c *connection) retransmit() (err error) {
-	if pk := c.retransmission.shift(); pk != nil {
-		c.cc.OnLoss()
-		if _, err := c.conn.Write(pk); err != nil {
+func (c *connection) retransmit(now time.Time) (err error) {
+	if pk, t := c.retransmission.shift(now, c.rtt.RTO()); len(pk) > 0 {
+		c.sender.OnCongestionEvent(now, t)
+		if _, err := c.writeDatagram(pk); err != nil {
 			return err
 		}
 	}
 	return
+}
+
+func (c *connection) wake() {
+	select {
+	case c.notify <- struct{}{}:
+	default:
+	}
+}
+
+func (c *connection) writeDatagram(p []byte) (int, error) {
+	return c.conn.Write(p, c.peerAddr)
+}
+
+func (c *connection) close(message string) (err error) {
+	c.once.Do(func() {
+		for _, stream := range c.streams.all() {
+			_ = stream.internalClose(fmt.Sprintf("closed by connection: %s", message))
+		}
+		c.cancelFunc(errors.New(message))
+		c.logger.Log("connection_close")
+		c.logger.Close()
+		_ = c.conn.Close()
+	})
+	return
+}
+
+func (c *connection) cleanup() {
+	<-c.ctx.Done()
+	c.retransmission.clear()
+	c.sendQueue.clear()
+	c.handler = nil
+	c.discovery.mtuIncrease = nil
+	clear(c.receiveQueue.queue)
+	close(c.packets)
+	close(c.notify)
+}
+
+func firstTime(idle, ack, retransmission, pacing time.Time) time.Time {
+	deadline := idle
+	if !ack.IsZero() && ack.Before(deadline) {
+		deadline = ack
+	}
+
+	if !retransmission.IsZero() && retransmission.Before(deadline) {
+		deadline = retransmission
+	}
+
+	if !pacing.IsZero() && pacing.Before(deadline) {
+		deadline = pacing
+	}
+	return deadline
 }

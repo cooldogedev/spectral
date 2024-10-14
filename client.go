@@ -3,11 +3,11 @@ package spectral
 import (
 	"context"
 	"errors"
-	"fmt"
+	"net"
 	"sync"
 
-	"github.com/cooldogedev/spectral/internal"
 	"github.com/cooldogedev/spectral/internal/frame"
+	"github.com/cooldogedev/spectral/internal/log"
 	"github.com/cooldogedev/spectral/internal/protocol"
 )
 
@@ -16,13 +16,13 @@ type ClientConnection struct {
 	response        chan *frame.ConnectionResponse
 	streamResponses map[protocol.StreamID]chan *frame.StreamResponse
 	streamID        protocol.StreamID
-	mu              sync.Mutex
+	mu              sync.RWMutex
 }
 
-func newClientConnection(conn *internal.Conn, ctx context.Context) *ClientConnection {
+func newClientConnection(conn *udpConn, peerAddr *net.UDPAddr, ctx context.Context) *ClientConnection {
 	c := &ClientConnection{
-		connection:      newConnection(conn, -1, ctx),
-		response:        make(chan *frame.ConnectionResponse),
+		connection:      newConnection(conn, peerAddr, -1, ctx, log.PerspectiveClient),
+		response:        make(chan *frame.ConnectionResponse, 1),
 		streamResponses: make(map[protocol.StreamID]chan *frame.StreamResponse),
 	}
 	c.connection.handler = c.handle
@@ -30,24 +30,39 @@ func newClientConnection(conn *internal.Conn, ctx context.Context) *ClientConnec
 }
 
 func (c *ClientConnection) OpenStream(ctx context.Context) (*Stream, error) {
+	ch := make(chan *frame.StreamResponse, 1)
 	c.mu.Lock()
 	streamID := c.streamID
 	c.streamID++
-	ch := make(chan *frame.StreamResponse, 1)
 	c.streamResponses[streamID] = ch
 	c.mu.Unlock()
-	if err := c.write(&frame.StreamRequest{StreamID: streamID}); err != nil {
+	defer func() {
+		close(ch)
+		c.mu.Lock()
+		delete(c.streamResponses, streamID)
+		c.mu.Unlock()
+	}()
+
+	c.logger.Log("stream_open_request", "streamID", streamID)
+	if err := c.writeControl(&frame.StreamRequest{StreamID: streamID}, true); err != nil {
 		return nil, err
 	}
 
 	select {
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		return nil, context.Cause(ctx)
 	case response := <-ch:
 		if response.Response == frame.StreamResponseFailed {
+			c.logger.Log("stream_open_fail", "streamID", streamID)
 			return nil, errors.New("failed to open stream")
 		}
-		return c.createStream(streamID)
+
+		stream, err := c.createStream(streamID)
+		if err != nil {
+			return nil, err
+		}
+		c.logger.Log("stream_open_success", "streamID", streamID)
+		return stream, nil
 	}
 }
 
@@ -56,14 +71,17 @@ func (c *ClientConnection) handle(fr frame.Frame) (err error) {
 	case *frame.ConnectionResponse:
 		c.response <- fr
 	case *frame.StreamResponse:
-		c.mu.Lock()
+		c.mu.RLock()
 		ch, ok := c.streamResponses[fr.StreamID]
-		delete(c.streamResponses, fr.StreamID)
-		c.mu.Unlock()
-		if !ok {
-			return fmt.Errorf("received an unknown stream response for %v", fr.StreamID)
+		c.mu.RUnlock()
+		if ok {
+			select {
+			case ch <- fr:
+			default:
+			}
+		} else {
+			c.logger.Log("stream_response_unknown", "streamID", fr.StreamID)
 		}
-		ch <- fr
 	}
 	return
 }

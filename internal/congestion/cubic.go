@@ -1,117 +1,99 @@
+//lint:file-ignore U1000 ignore all unused for now.
+
 package congestion
 
 import (
 	"math"
-	"sync"
 	"time"
 
-	"github.com/cooldogedev/spectral/internal/protocol"
+	"github.com/cooldogedev/spectral/internal/log"
 )
 
 const (
-	maxBurstPackets = 3
-
-	initialWindow = protocol.MaxPacketSize * 32
-	minWindow     = protocol.MaxPacketSize * 2
-	maxWindow     = protocol.MaxPacketSize * 10000
-
 	cubicBeta = 0.7
 	cubicC    = 0.4
 )
 
-type Cubic struct {
-	awaiting   uint64
-	flight     uint64
-	cwnd       uint64
-	wMax       uint64
-	ssthresh   uint64
-	k          float64
-	ch         chan struct{}
-	epochStart time.Time
-	mu         sync.RWMutex
+func cubicK(wMax float64, mss uint64) float64 {
+	return math.Cbrt(wMax / float64(mss) * (1.0 - cubicBeta) / cubicC)
 }
 
-func NewCubic() *Cubic {
-	return &Cubic{
-		cwnd:     initialWindow,
-		wMax:     initialWindow,
-		ssthresh: math.MaxUint64,
-		ch:       make(chan struct{}, 1),
+func wCubic(t time.Duration, wMax float64, k float64, mss uint64) float64 {
+	return cubicC * (math.Pow(t.Seconds()-k, 3) + wMax/float64(mss)) * float64(mss)
+}
+
+func wEst(t time.Duration, rtt time.Duration, wMax float64, mss uint64) float64 {
+	return (wMax/float64(mss)*cubicBeta + 3.0*(1.0-cubicBeta)/(1.0+cubicBeta)*t.Seconds()/rtt.Seconds()) * float64(mss)
+}
+
+type cubic struct {
+	window  uint64
+	ssthres uint64
+	mss     uint64
+	cwndInc uint64
+	wMax    float64
+	k       float64
+	logger  log.Logger
+}
+
+func newCubic(logger log.Logger, mss uint64) *cubic {
+	window := initialWindow(mss)
+	return &cubic{
+		window:  window,
+		ssthres: math.MaxUint64,
+		mss:     mss,
+		wMax:    float64(window),
+		logger:  logger,
 	}
 }
 
-func (c *Cubic) ScheduleSend(bytes uint64) chan struct{} {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.cwnd-c.flight >= bytes {
-		return nil
-	}
-	c.awaiting = bytes
-	return c.ch
-}
-
-func (c *Cubic) OnSend(bytes uint64) {
-	c.mu.Lock()
-	c.awaiting = 0
-	c.flight += bytes
-	c.mu.Unlock()
-}
-
-func (c *Cubic) OnAck(bytes uint64) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	c.flight = max(c.flight-bytes, 0)
-	if c.awaiting != 0 && c.cwnd-c.flight >= c.awaiting {
-		c.ch <- struct{}{}
-	}
-
-	if !c.shouldIncreaseWindow() {
+func (c *cubic) OnAck(now, _, recoveryStartTime time.Time, rtt time.Duration, bytes uint64) {
+	if c.window < c.ssthres {
+		c.window += bytes
+		c.logger.Log("congestion_window_increase", "cause", "slow_start", "window", c.window)
 		return
 	}
 
-	if c.ssthresh > c.cwnd {
-		c.cwnd = min(c.cwnd+bytes, maxWindow)
-		return
+	t := now.Sub(recoveryStartTime)
+	w := wCubic(t+rtt, c.wMax, c.k, c.mss)
+	est := wEst(t, rtt, c.wMax, c.mss)
+	cubicCwnd := c.window
+	if w < est {
+		cubicCwnd = max(cubicCwnd, uint64(est))
+	} else if cubicCwnd < uint64(w) {
+		cubicCwnd += uint64((w - float64(cubicCwnd)) / float64(cubicCwnd) * float64(c.mss))
 	}
 
-	if c.epochStart.IsZero() {
-		c.epochStart = time.Now()
-		c.k = math.Cbrt(float64(c.wMax) * (1.0 - cubicBeta) / cubicC)
-	}
-
-	elapsed := time.Since(c.epochStart).Seconds()
-	cwnd := uint64(cubicC*math.Pow(elapsed-c.k, 3) + float64(c.wMax))
-	if cwnd > c.cwnd {
-		c.cwnd = min(cwnd, maxWindow)
+	c.cwndInc += cubicCwnd - c.window
+	if c.cwndInc >= c.mss {
+		c.window += c.mss
+		c.cwndInc = 0
+		c.logger.Log("congestion_window_increase", "cause", "congestion_avoidance", "window", c.window)
 	}
 }
 
-func (c *Cubic) OnLoss() {
-	c.mu.Lock()
-	c.flight = 0
-	if c.awaiting != 0 {
-		c.ch <- struct{}{}
+func (c *cubic) OnCongestionEvent(_ time.Time, _ time.Time) {
+	if float64(c.window) < c.wMax {
+		c.wMax = float64(c.window) * (1.0 - cubicBeta) / 2.0
+	} else {
+		c.wMax = float64(c.window)
 	}
-	c.wMax = c.cwnd
-	c.cwnd = max(uint64(float64(c.cwnd)*cubicBeta), minWindow)
-	c.ssthresh = c.cwnd
-	c.epochStart = time.Time{}
-	c.k = math.Cbrt(float64(c.wMax) * (1.0 - cubicBeta) / cubicC)
-	c.mu.Unlock()
+	c.ssthres = max(uint64(c.wMax*cubicBeta), minimumWindow(c.mss))
+	c.window = c.ssthres
+	c.k = cubicK(c.wMax, c.mss)
+	c.cwndInc = uint64(float64(c.cwndInc) * cubicBeta)
+	c.logger.Log("congestion_window_decrease", "window", c.window)
 }
 
-func (c *Cubic) Cwnd() uint64 {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.cwnd
+func (c *cubic) SetMSS(mss uint64) {
+	c.mss = mss
+	c.window = max(c.window, minimumWindow(mss))
 }
 
-func (c *Cubic) shouldIncreaseWindow() bool {
-	if c.flight >= c.cwnd {
-		return true
-	}
-	availableBytes := c.cwnd - c.flight
-	slowStartLimited := c.ssthresh > c.cwnd && c.flight > c.cwnd/2
-	return slowStartLimited || availableBytes <= maxBurstPackets*protocol.MaxPacketSize
+func (c *cubic) MSS() uint64 {
+	return c.mss
+}
+
+func (c *cubic) Window() uint64 {
+	return c.window
 }
