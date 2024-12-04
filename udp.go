@@ -47,6 +47,7 @@ func (c *udpConn) Read(f func(d *datagram) error) {
 			continue
 		}
 
+		dgram.b = dgram.b[:n]
 		dgram.peerAddr = addr
 		if err := f(dgram); err != nil {
 			return
