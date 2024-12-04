@@ -34,7 +34,7 @@ func newListener(conn *udpConn) *Listener {
 		defer dgram.reset()
 		connectionID, sequenceID, frames, err := frame.Unpack(dgram.b)
 		if err != nil {
-			return
+			return nil
 		}
 
 		listener.connectionsMu.Lock()
