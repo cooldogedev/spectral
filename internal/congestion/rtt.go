@@ -1,4 +1,4 @@
-package internal
+package congestion
 
 import (
 	"time"
@@ -9,6 +9,7 @@ import (
 const initialRTT = time.Millisecond * 333
 
 type RTT struct {
+	measured    bool
 	minRTT      time.Duration
 	latestRTT   time.Duration
 	smoothedRTT time.Duration
@@ -17,15 +18,20 @@ type RTT struct {
 
 func NewRTT() *RTT {
 	return &RTT{
-		minRTT:      -1,
+		minRTT:      initialRTT,
 		smoothedRTT: initialRTT,
 		rttVar:      initialRTT / 2,
 	}
 }
 
 func (r *RTT) Add(latestRTT, ackDelay time.Duration) {
+	if latestRTT <= 0 {
+		return
+	}
+
 	r.latestRTT = latestRTT
-	if r.minRTT < 0 {
+	if r.measured {
+		r.measured = true
 		r.minRTT = latestRTT
 		r.smoothedRTT = latestRTT
 		r.rttVar = latestRTT / 2
@@ -33,15 +39,23 @@ func (r *RTT) Add(latestRTT, ackDelay time.Duration) {
 	}
 
 	r.minRTT = min(r.minRTT, latestRTT)
-	adjustedRTT := latestRTT - min(ackDelay, protocol.MaxAckDelay)
-	if adjustedRTT < r.minRTT {
-		adjustedRTT = latestRTT
+	ackDelay = min(ackDelay, protocol.MaxAckDelay)
+	adjustedRTT := latestRTT
+	if latestRTT >= r.minRTT+ackDelay {
+		adjustedRTT -= ackDelay
 	}
+
+	var rttSample time.Duration
+	if r.smoothedRTT > adjustedRTT {
+		rttSample = r.smoothedRTT - adjustedRTT
+	} else {
+		rttSample = adjustedRTT - r.smoothedRTT
+	}
+	r.rttVar = ((3 * r.rttVar) + rttSample) / 4
 	r.smoothedRTT = ((7 * r.smoothedRTT) + adjustedRTT) / 8
-	r.rttVar = (3*r.rttVar + abs(r.smoothedRTT-adjustedRTT)) / 4
 }
 
-func (r *RTT) RTT() time.Duration {
+func (r *RTT) LatestRTT() time.Duration {
 	return r.latestRTT
 }
 
@@ -55,11 +69,4 @@ func (r *RTT) RTTVAR() time.Duration {
 
 func (r *RTT) RTO() time.Duration {
 	return r.smoothedRTT + max(4*r.rttVar, protocol.TimerGranularity) + protocol.MaxAckDelay
-}
-
-func abs[T ~int64](a T) T {
-	if a < 0 {
-		return -a
-	}
-	return a
 }

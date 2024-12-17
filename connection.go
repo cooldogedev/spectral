@@ -11,7 +11,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/cooldogedev/spectral/internal"
 	"github.com/cooldogedev/spectral/internal/congestion"
 	"github.com/cooldogedev/spectral/internal/frame"
 	"github.com/cooldogedev/spectral/internal/log"
@@ -47,7 +46,6 @@ type connection struct {
 	ctx            context.Context
 	cancelFunc     context.CancelCauseFunc
 	sender         *congestion.Sender
-	pacer          *congestion.Pacer
 	packets        chan *receivedPacket
 	ack            *ackQueue
 	receiveQueue   *receiveQueue
@@ -55,14 +53,13 @@ type connection struct {
 	sendQueue      *sendQueue
 	streams        *streamMap
 	discovery      *mtuDiscovery
-	rtt            *internal.RTT
+	rtt            *congestion.RTT
 	handler        func(frame.Frame) error
 	notify         chan struct{}
 	idle           time.Time
 	pacingDeadline time.Time
 	once           sync.Once
 	logger         log.Logger
-	mss            uint64
 }
 
 func newConnection(conn *udpConn, peerAddr *net.UDPAddr, connectionID protocol.ConnectionID, parentCtx context.Context, perspective log.Perspective) *connection {
@@ -74,8 +71,7 @@ func newConnection(conn *udpConn, peerAddr *net.UDPAddr, connectionID protocol.C
 		peerAddr:       peerAddr,
 		ctx:            ctx,
 		cancelFunc:     cancelFunc,
-		sender:         congestion.NewRenoSender(logger, now, mtuMin),
-		pacer:          congestion.NewPacer(now),
+		sender:         congestion.NewSender(logger, now, protocol.MinPacketSize),
 		packets:        make(chan *receivedPacket, 512),
 		ack:            newAckQueue(),
 		receiveQueue:   newReceiveQueue(),
@@ -84,16 +80,14 @@ func newConnection(conn *udpConn, peerAddr *net.UDPAddr, connectionID protocol.C
 		streams:        newStreamMap(),
 		notify:         make(chan struct{}, 1),
 		idle:           now.Add(inactivityTimeout),
-		rtt:            internal.NewRTT(),
+		rtt:            congestion.NewRTT(),
 		logger:         logger,
-		mss:            mtuMin,
 	}
 	c.connectionID.Store(int64(connectionID))
 	c.discovery = newMTUDiscovery(now, func(mtu uint64) {
-		c.logger.Log("mtu_update", "old", c.mss, "new", mtu)
-		c.mss = mtu
 		c.sender.SetMSS(mtu)
 		c.sendQueue.setMSS(mtu)
+		c.logger.Log("mtu_update", "new", mtu)
 	})
 	go c.run(now)
 	return c
@@ -256,10 +250,10 @@ func (c *connection) handle(now time.Time, fr frame.Frame) (err error) {
 		for _, r := range fr.Ranges {
 			for i := r[0]; i <= r[1]; i++ {
 				if entry := c.retransmission.remove(i); entry != nil {
-					c.sender.OnAck(now, entry.sent, c.rtt.SRTT(), uint64(len(entry.payload)))
 					if i == fr.Max {
-						c.rtt.Add(time.Since(entry.sent), time.Duration(fr.Delay))
+						c.rtt.Add(now.Sub(entry.sent), time.Duration(fr.Delay))
 					}
+					c.sender.OnAck(now, entry.sent, c.rtt, uint64(len(entry.payload)))
 				}
 			}
 		}
@@ -312,8 +306,8 @@ func (c *connection) writeControl(fr frame.Frame, needsAck bool) (err error) {
 
 func (c *connection) maybeSend(now time.Time) (err error) {
 	if c.conn.mtud && !c.discovery.discovered && c.discovery.sendProbe(now, c.rtt.SRTT()) {
-		c.logger.Log("mtu_probe", "old", c.mss, "new", c.discovery.current)
 		_ = c.writeControl(&frame.MTURequest{MTU: c.discovery.current}, false)
+		c.logger.Log("mtu_probe", "new", c.discovery.current)
 	}
 
 	for c.sendQueue.available() {
@@ -336,16 +330,22 @@ func (c *connection) maybeSend(now time.Time) (err error) {
 }
 
 func (c *connection) transmit(now time.Time) (wouldBlock bool, err error) {
-	total, p := c.sendQueue.pack(c.sender.Available())
-	if total == 0 {
-		c.logger.Log("congestion_blocked")
+	available := c.sender.Available()
+	if available == 0 {
+		c.logger.Log("congestion_block", "window", available)
 		return true, nil
 	}
 
+	total, p := c.sendQueue.pack(available)
 	length := uint64(len(p))
-	if d := c.pacer.Delay(now, c.rtt.SRTT(), length, c.mss, c.sender.Window()); !d.IsZero() && d.After(now) {
-		c.pacingDeadline = d
-		c.logger.Log("pacer_block", "len", length, "delay", now.Sub(d).Nanoseconds())
+	if total == 0 {
+		c.logger.Log("congestion_block", "window", available)
+		return true, nil
+	}
+
+	if t := c.sender.TimeUntilSend(now, c.rtt, length); !t.IsZero() && t.After(now) {
+		c.pacingDeadline = t
+		c.logger.Log("pacer_block", "len", length, "window", available)
 		return true, nil
 	}
 
@@ -356,7 +356,6 @@ func (c *connection) transmit(now time.Time) (wouldBlock bool, err error) {
 		return false, err
 	}
 	c.sender.OnSend(length)
-	c.pacer.OnSend(length)
 	c.retransmission.add(now, sequenceID, pk)
 	return
 }

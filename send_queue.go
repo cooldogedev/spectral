@@ -17,7 +17,7 @@ type sendQueue struct {
 func newSendQueue() *sendQueue {
 	return &sendQueue{
 		pk:             make([]byte, 0, protocol.MaxPacketSize),
-		maxSegmentSize: mtuMin,
+		maxSegmentSize: protocol.MinPacketSize,
 	}
 }
 

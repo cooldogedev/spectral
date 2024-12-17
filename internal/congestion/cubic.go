@@ -27,73 +27,78 @@ func wEst(t time.Duration, rtt time.Duration, wMax float64, mss uint64) float64 
 }
 
 type cubic struct {
-	window  uint64
-	ssthres uint64
-	mss     uint64
-	cwndInc uint64
-	wMax    float64
-	k       float64
-	logger  log.Logger
+	cwnd           uint64
+	ssthres        uint64
+	maxSegmentSize uint64
+	cwndInc        uint64
+	wMax           float64
+	k              float64
+	logger         log.Logger
 }
 
 func newCubic(logger log.Logger, mss uint64) *cubic {
 	window := initialWindow(mss)
 	return &cubic{
-		window:  window,
-		ssthres: math.MaxUint64,
-		mss:     mss,
-		wMax:    float64(window),
-		logger:  logger,
+		cwnd:           window,
+		ssthres:        math.MaxUint64,
+		maxSegmentSize: mss,
+		wMax:           float64(window),
+		logger:         logger,
 	}
 }
 
-func (c *cubic) OnAck(now, _, recoveryStartTime time.Time, rtt time.Duration, bytes uint64) {
-	if c.window < c.ssthres {
-		c.window += bytes
-		c.logger.Log("congestion_window_increase", "cause", "slow_start", "window", c.window)
+func (c *cubic) onAck(now, _, recoveryStartTime time.Time, rtt *RTT, bytes, flight uint64) {
+	if !shouldIncreaseWindow(flight, c.cwnd, c.ssthres) {
 		return
 	}
 
+	if c.cwnd < c.ssthres {
+		c.cwnd += bytes
+		c.logger.Log("congestion_window_increase", "cause", "slow_start", "window", c.cwnd)
+		return
+	}
+
+	smoothedRTT := rtt.SRTT()
 	t := now.Sub(recoveryStartTime)
-	w := wCubic(t+rtt, c.wMax, c.k, c.mss)
-	est := wEst(t, rtt, c.wMax, c.mss)
-	cubicCwnd := c.window
+	w := wCubic(t+smoothedRTT, c.wMax, c.k, c.maxSegmentSize)
+	est := wEst(t, smoothedRTT, c.wMax, c.maxSegmentSize)
+	cubicCwnd := c.cwnd
 	if w < est {
 		cubicCwnd = max(cubicCwnd, uint64(est))
 	} else if cubicCwnd < uint64(w) {
-		cubicCwnd += uint64((w - float64(cubicCwnd)) / float64(cubicCwnd) * float64(c.mss))
+		cubicCwnd += uint64((w - float64(cubicCwnd)) / float64(cubicCwnd) * float64(c.maxSegmentSize))
 	}
 
-	c.cwndInc += cubicCwnd - c.window
-	if c.cwndInc >= c.mss {
-		c.window += c.mss
+	c.cwndInc += cubicCwnd - c.cwnd
+	if c.cwndInc >= c.maxSegmentSize {
+		c.cwnd += c.maxSegmentSize
 		c.cwndInc = 0
-		c.logger.Log("congestion_window_increase", "cause", "congestion_avoidance", "window", c.window)
+		c.logger.Log("congestion_window_increase", "cause", "congestion_avoidance", "window", c.cwnd)
 	}
 }
 
-func (c *cubic) OnCongestionEvent(_ time.Time, _ time.Time) {
-	if float64(c.window) < c.wMax {
-		c.wMax = float64(c.window) * (1.0 - cubicBeta) / 2.0
+func (c *cubic) onCongestionEvent(_ time.Time, _ time.Time) {
+	if float64(c.cwnd) < c.wMax {
+		c.wMax = float64(c.cwnd) * (1.0 - cubicBeta) / 2.0
 	} else {
-		c.wMax = float64(c.window)
+		c.wMax = float64(c.cwnd)
 	}
-	c.ssthres = max(uint64(c.wMax*cubicBeta), minimumWindow(c.mss))
-	c.window = c.ssthres
-	c.k = cubicK(c.wMax, c.mss)
+	c.ssthres = max(uint64(c.wMax*cubicBeta), minimumWindow(c.maxSegmentSize))
+	c.cwnd = c.ssthres
+	c.k = cubicK(c.wMax, c.maxSegmentSize)
 	c.cwndInc = uint64(float64(c.cwndInc) * cubicBeta)
-	c.logger.Log("congestion_window_decrease", "window", c.window)
+	c.logger.Log("congestion_window_decrease", "window", c.cwnd)
 }
 
-func (c *cubic) SetMSS(mss uint64) {
-	c.mss = mss
-	c.window = max(c.window, minimumWindow(mss))
+func (c *cubic) setMSS(mss uint64) {
+	c.maxSegmentSize = mss
+	c.cwnd = max(c.cwnd, minimumWindow(mss))
 }
 
-func (c *cubic) MSS() uint64 {
-	return c.mss
+func (c *cubic) mss() uint64 {
+	return c.maxSegmentSize
 }
 
-func (c *cubic) Window() uint64 {
-	return c.window
+func (c *cubic) window() uint64 {
+	return c.cwnd
 }

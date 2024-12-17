@@ -11,46 +11,57 @@ type Sender struct {
 	recoverySend      bool
 	recoveryStartTime time.Time
 	cc                controller
+	pacer             *pacer
 }
 
-func NewRenoSender(logger log.Logger, now time.Time, mss uint64) *Sender {
+func NewSender(logger log.Logger, now time.Time, mss uint64) *Sender {
 	return &Sender{
-		cc:                newReno(logger, mss),
 		recoveryStartTime: now,
+		cc:                newReno(logger, mss),
+		pacer:             newPacer(now),
 	}
 }
 
-func (r *Sender) OnSend(bytes uint64) {
-	r.flight += bytes
-	if r.recoverySend {
-		r.recoverySend = false
+func (s *Sender) TimeUntilSend(now time.Time, rtt *RTT, bytes uint64) time.Time {
+	return s.pacer.timeUntilSend(now, rtt.SRTT(), bytes, s.cc.mss(), s.cc.window())
+}
+
+func (s *Sender) OnSend(bytes uint64) {
+	s.flight += bytes
+	s.pacer.onSend(bytes)
+	if s.recoverySend {
+		s.recoverySend = false
 	}
 }
 
-func (r *Sender) OnAck(now, sent time.Time, rtt time.Duration, bytes uint64) {
-	r.flight = max(r.flight-bytes, 0)
-	r.cc.OnAck(now, sent, r.recoveryStartTime, rtt, bytes)
+func (s *Sender) OnAck(now, sent time.Time, rtt *RTT, bytes uint64) {
+	if s.flight > bytes {
+		s.flight -= bytes
+	} else {
+		s.flight = 0
+	}
+	s.cc.onAck(now, sent, s.recoveryStartTime, rtt, bytes, s.flight)
 }
 
-func (r *Sender) OnCongestionEvent(now time.Time, sent time.Time) {
-	if sent.After(r.recoveryStartTime) {
-		r.recoverySend = true
-		r.recoveryStartTime = now
-		r.cc.OnCongestionEvent(now, sent)
+func (s *Sender) OnCongestionEvent(now time.Time, sent time.Time) {
+	if sent.After(s.recoveryStartTime) {
+		s.recoverySend = true
+		s.recoveryStartTime = now
+		s.cc.onCongestionEvent(now, sent)
 	}
 }
 
-func (r *Sender) SetMSS(mss uint64) {
-	r.cc.SetMSS(mss)
+func (s *Sender) SetMSS(mss uint64) {
+	s.cc.setMSS(mss)
 }
 
-func (r *Sender) Window() uint64 {
-	return r.cc.Window()
-}
-
-func (r *Sender) Available() uint64 {
-	if r.recoverySend {
-		return r.cc.MSS()
+func (s *Sender) Available() uint64 {
+	if s.recoverySend {
+		return s.cc.mss()
 	}
-	return r.cc.Window() - r.flight
+
+	if window := s.cc.window(); window > s.flight {
+		return window - s.flight
+	}
+	return 0
 }

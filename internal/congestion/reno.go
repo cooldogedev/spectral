@@ -10,57 +10,61 @@ import (
 const renoReductionFactor = 0.5
 
 type reno struct {
-	mss        uint64
-	window     uint64
-	ssthres    uint64
-	bytesAcked uint64
-	logger     log.Logger
+	maxSegmentSize uint64
+	cwnd           uint64
+	ssthres        uint64
+	bytesAcked     uint64
+	logger         log.Logger
 }
 
 func newReno(logger log.Logger, mss uint64) *reno {
 	return &reno{
-		mss:     mss,
-		window:  initialWindow(mss),
-		ssthres: math.MaxUint64,
-		logger:  logger,
+		maxSegmentSize: mss,
+		cwnd:           initialWindow(mss),
+		ssthres:        math.MaxUint64,
+		logger:         logger,
 	}
 }
 
-func (r *reno) OnAck(_, _, _ time.Time, _ time.Duration, bytes uint64) {
-	if r.window < r.ssthres {
-		r.window += bytes
-		r.logger.Log("congestion_window_increase", "cause", "slow_start", "window", r.window)
-		if r.window >= r.ssthres {
-			r.bytesAcked = r.window - r.ssthres
-			r.logger.Log("congestion_exit_slow_start", "window", r.window, "threshold", r.ssthres)
-		}
+func (r *reno) onAck(_, _, _ time.Time, _ *RTT, bytes, flight uint64) {
+	if !shouldIncreaseWindow(flight, r.cwnd, r.ssthres) {
 		return
 	}
 
-	r.bytesAcked += bytes
-	if r.bytesAcked >= r.window {
-		r.bytesAcked -= r.window
-		r.window += r.mss
-		r.logger.Log("congestion_window_increase", "cause", "congestion_avoidance", "window", r.window, "acked", r.bytesAcked)
+	if r.cwnd < r.ssthres {
+		r.cwnd += r.maxSegmentSize
+		r.logger.Log("congestion_window_increase", "cause", "slow_start", "window", r.cwnd, "threshold", r.ssthres)
+		if r.cwnd >= r.ssthres {
+			r.ssthres = r.cwnd
+			r.logger.Log("congestion_exit_slow_start", "window", r.cwnd, "threshold", r.ssthres)
+		}
+	} else {
+		r.bytesAcked += bytes
+		if r.bytesAcked >= r.cwnd {
+			r.bytesAcked -= r.cwnd
+			r.cwnd += r.maxSegmentSize
+			r.logger.Log("congestion_window_increase", "cause", "congestion_avoidance", "window", r.cwnd, "threshold", r.ssthres, "acked", r.bytesAcked)
+		}
 	}
 }
 
-func (r *reno) OnCongestionEvent(_ time.Time, _ time.Time) {
-	r.window = uint64(float64(r.window) * renoReductionFactor)
-	r.window = max(r.window, minimumWindow(r.mss))
-	r.ssthres = r.window
-	r.logger.Log("congestion_window_decrease", "window", r.window)
+func (r *reno) onCongestionEvent(_ time.Time, _ time.Time) {
+	r.cwnd = uint64(float64(r.cwnd) * renoReductionFactor)
+	r.cwnd = max(r.cwnd, minimumWindow(r.maxSegmentSize))
+	r.bytesAcked = uint64(float64(r.cwnd) * renoReductionFactor)
+	r.ssthres = r.cwnd
+	r.logger.Log("congestion_window_decrease", "window", r.cwnd, "threshold", r.ssthres)
 }
 
-func (r *reno) SetMSS(mss uint64) {
-	r.mss = mss
-	r.window = max(r.window, minimumWindow(mss))
+func (r *reno) setMSS(mss uint64) {
+	r.maxSegmentSize = mss
+	r.cwnd = max(r.cwnd, minimumWindow(mss))
 }
 
-func (r *reno) MSS() uint64 {
-	return r.mss
+func (r *reno) mss() uint64 {
+	return r.maxSegmentSize
 }
 
-func (r *reno) Window() uint64 {
-	return r.window
+func (r *reno) window() uint64 {
+	return r.cwnd
 }

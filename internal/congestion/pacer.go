@@ -11,7 +11,7 @@ const (
 	maxBurstSize             = 256
 )
 
-type Pacer struct {
+type pacer struct {
 	capacity uint64
 	tokens   uint64
 	mss      uint64
@@ -19,11 +19,11 @@ type Pacer struct {
 	prev     time.Time
 }
 
-func NewPacer(now time.Time) *Pacer {
-	return &Pacer{prev: now}
+func newPacer(now time.Time) *pacer {
+	return &pacer{prev: now}
 }
 
-func (p *Pacer) Delay(now time.Time, rtt time.Duration, bytes uint64, mss uint64, window uint64) (t time.Time) {
+func (p *pacer) timeUntilSend(now time.Time, rtt time.Duration, bytes uint64, mss uint64, window uint64) (t time.Time) {
 	if mss != p.mss || window != p.window {
 		p.capacity = optimalCapacity(rtt, mss, window)
 		p.tokens = min(p.tokens, p.capacity)
@@ -31,11 +31,7 @@ func (p *Pacer) Delay(now time.Time, rtt time.Duration, bytes uint64, mss uint64
 		p.window = window
 	}
 
-	if p.tokens >= bytes {
-		return
-	}
-
-	if window >= math.MaxUint32 {
+	if p.tokens >= bytes || window >= math.MaxUint32 {
 		return
 	}
 
@@ -51,8 +47,12 @@ func (p *Pacer) Delay(now time.Time, rtt time.Duration, bytes uint64, mss uint64
 	return p.prev.Add(time.Duration(unscaledDelay/5) * 4)
 }
 
-func (p *Pacer) OnSend(bytes uint64) {
-	p.tokens = max(p.tokens-bytes, 0)
+func (p *pacer) onSend(bytes uint64) {
+	if p.tokens > bytes {
+		p.tokens -= bytes
+	} else {
+		p.tokens = 0
+	}
 }
 
 func optimalCapacity(rtt time.Duration, mss uint64, window uint64) uint64 {

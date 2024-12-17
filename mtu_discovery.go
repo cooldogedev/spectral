@@ -1,17 +1,14 @@
 package spectral
 
 import (
-	"github.com/cooldogedev/spectral/internal/protocol"
 	"time"
+
+	"github.com/cooldogedev/spectral/internal/protocol"
 )
 
 const (
-	mtuMin  = protocol.MinPacketSize
-	mtuMax  = protocol.MaxPacketSize
 	mtuDiff = 20
-)
 
-const (
 	probeDelay    = 5
 	probeAttempts = 3
 )
@@ -27,7 +24,7 @@ type mtuDiscovery struct {
 func newMTUDiscovery(now time.Time, mtuIncrease func(mtu uint64)) *mtuDiscovery {
 	m := &mtuDiscovery{
 		mtuIncrease: mtuIncrease,
-		current:     mtuMin,
+		current:     protocol.MinPacketSize,
 		prev:        now,
 	}
 	m.discover()
@@ -60,10 +57,10 @@ func (m *mtuDiscovery) sendProbe(now time.Time, rtt time.Duration) bool {
 }
 
 func (m *mtuDiscovery) discover() {
-	if m.current >= mtuMax {
+	if m.current >= protocol.MaxPacketSize {
 		m.discovered = true
 		return
 	}
 	m.flight = 0
-	m.current = min(m.current+mtuDiff, mtuMax)
+	m.current = min(m.current+mtuDiff, protocol.MaxPacketSize)
 }
