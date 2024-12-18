@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"math"
 	"net"
-	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -119,19 +118,6 @@ func (c *connection) Context() context.Context {
 	return c.ctx
 }
 
-func (c *connection) createStream(streamID protocol.StreamID) (*Stream, error) {
-	if c.streams.get(streamID) != nil {
-		c.logger.Log("duplicate_stream", "streamID", streamID)
-		return nil, fmt.Errorf("stream %v already exists", streamID)
-	}
-	stream := newStream(streamID, c.ctx, c.sendQueue, c.wake, func() {
-		_ = c.writeControl(&frame.StreamClose{StreamID: streamID}, true)
-		c.streams.remove(streamID)
-	}, c.logger)
-	c.streams.add(stream)
-	return stream, nil
-}
-
 func (c *connection) run(now time.Time) {
 	var lastDeadline time.Time
 	timer := time.NewTimer(deadlineInf)
@@ -215,8 +201,11 @@ func (c *connection) triggerTimer(now time.Time) (err error) {
 		return errors.New("network inactivity")
 	}
 
-	if err := c.retransmit(now); err != nil {
-		return err
+	if pk, t := c.retransmission.shift(now, c.rtt.RTO()); len(pk) > 0 {
+		c.sender.OnCongestionEvent(now, t)
+		if _, err := c.writeDatagram(pk); err != nil {
+			return err
+		}
 	}
 	return
 }
@@ -239,8 +228,6 @@ func (c *connection) receive(now, t time.Time, sequenceID uint32, frames []frame
 			return err
 		}
 	}
-	//lint:ignore SA6002 ignore this for now.
-	frame.Pool.Put(frames[:0])
 	return
 }
 
@@ -251,9 +238,9 @@ func (c *connection) handle(now time.Time, fr frame.Frame) (err error) {
 			for i := r[0]; i <= r[1]; i++ {
 				if entry := c.retransmission.remove(i); entry != nil {
 					if i == fr.Max {
-						c.rtt.Add(now.Sub(entry.sent), time.Duration(fr.Delay))
+						c.rtt.Add(now.Sub(entry.sent), time.Microsecond*time.Duration(fr.Delay))
 					}
-					c.sender.OnAck(now, entry.sent, c.rtt, uint64(len(entry.payload)))
+					c.sender.OnAck(now, entry.sent, c.rtt, uint64(len(entry.payload))-protocol.PacketHeaderSize)
 				}
 			}
 		}
@@ -267,8 +254,8 @@ func (c *connection) handle(now time.Time, fr frame.Frame) (err error) {
 		}
 	case *frame.StreamClose:
 		if stream := c.streams.get(fr.StreamID); stream != nil {
-			c.logger.Log("stream_close_request", "streamID", fr.StreamID)
 			_ = stream.internalClose("closed by peer")
+			c.logger.Log("stream_close_request", "streamID", fr.StreamID)
 		}
 	case *frame.MTURequest:
 		if err := c.writeControl(&frame.MTUResponse{MTU: fr.MTU}, false); err != nil {
@@ -278,29 +265,6 @@ func (c *connection) handle(now time.Time, fr frame.Frame) (err error) {
 		c.discovery.onAck(fr.MTU)
 	}
 	frame.PutFrame(fr)
-	return
-}
-
-func (c *connection) writeControl(fr frame.Frame, needsAck bool) (err error) {
-	select {
-	case <-c.ctx.Done():
-		return context.Cause(c.ctx)
-	default:
-	}
-
-	var sequenceID uint32
-	if needsAck {
-		sequenceID = c.sequenceID.Add(1)
-	}
-
-	pk := frame.Pack(protocol.ConnectionID(c.connectionID.Load()), sequenceID, 1, frame.PackSingle(fr))
-	if _, err := c.writeDatagram(pk); err != nil {
-		return err
-	}
-
-	if needsAck {
-		c.retransmission.add(time.Now(), sequenceID, pk)
-	}
 	return
 }
 
@@ -336,9 +300,9 @@ func (c *connection) transmit(now time.Time) (wouldBlock bool, err error) {
 		return true, nil
 	}
 
-	total, p := c.sendQueue.pack(available)
+	p := c.sendQueue.pack(available)
 	length := uint64(len(p))
-	if total == 0 {
+	if length == 0 {
 		c.logger.Log("congestion_block", "window", available)
 		return true, nil
 	}
@@ -350,9 +314,9 @@ func (c *connection) transmit(now time.Time) (wouldBlock bool, err error) {
 	}
 
 	sequenceID := c.sequenceID.Add(1)
-	pk := frame.Pack(protocol.ConnectionID(c.connectionID.Load()), sequenceID, total, p)
+	pk := frame.Pack(protocol.ConnectionID(c.connectionID.Load()), sequenceID, p)
 	c.sendQueue.flush()
-	if _, err := c.writeDatagram(pk); err != nil {
+	if _, err := c.writeDatagram(c.appendAcknowledgements(now, pk)); err != nil {
 		return false, err
 	}
 	c.sender.OnSend(length)
@@ -360,25 +324,22 @@ func (c *connection) transmit(now time.Time) (wouldBlock bool, err error) {
 	return
 }
 
-func (c *connection) acknowledge(now time.Time) (err error) {
-	list, maxSequenceID, delay := c.ack.flush(now)
-	if len(list) > 0 {
-		fr := &frame.Acknowledgement{Delay: delay.Nanoseconds(), Max: maxSequenceID}
-		ranges := frame.GenerateAcknowledgementRanges(list)
-		for chunk := range slices.Chunk(ranges, 128) {
-			fr.Ranges = chunk
-			if err := c.writeControl(fr, false); err != nil {
-				return err
-			}
-		}
+func (c *connection) appendAcknowledgements(now time.Time, p []byte) []byte {
+	total := (int(c.sendQueue.mss()) - len(p) - 16) / 8
+	if ranges, maxSequenceID, delay := c.ack.flush(now, total, true); len(ranges) > 0 {
+		return append(p, frame.PackSingle(&frame.Acknowledgement{Delay: delay, Max: maxSequenceID, Ranges: ranges})...)
 	}
-	return
+	return p
 }
 
-func (c *connection) retransmit(now time.Time) (err error) {
-	if pk, t := c.retransmission.shift(now, c.rtt.RTO()); len(pk) > 0 {
-		c.sender.OnCongestionEvent(now, t)
-		if _, err := c.writeDatagram(pk); err != nil {
+func (c *connection) acknowledge(now time.Time) (err error) {
+	for {
+		ranges, maxSequenceID, delay := c.ack.flush(now, protocol.MaxAckRanges, false)
+		if len(ranges) == 0 {
+			break
+		}
+
+		if err := c.writeControl(&frame.Acknowledgement{Delay: delay, Max: maxSequenceID, Ranges: ranges}, false); err != nil {
 			return err
 		}
 	}
@@ -392,8 +353,43 @@ func (c *connection) wake() {
 	}
 }
 
+func (c *connection) writeControl(fr frame.Frame, needsAck bool) (err error) {
+	var sequenceID uint32
+	if needsAck {
+		sequenceID = c.sequenceID.Add(1)
+	}
+
+	pk := frame.Pack(protocol.ConnectionID(c.connectionID.Load()), sequenceID, frame.PackSingle(fr))
+	if _, err := c.writeDatagram(pk); err != nil {
+		return err
+	}
+
+	if needsAck {
+		c.retransmission.add(time.Now(), sequenceID, pk)
+	}
+	return
+}
+
 func (c *connection) writeDatagram(p []byte) (int, error) {
+	select {
+	case <-c.ctx.Done():
+		return 0, context.Cause(c.ctx)
+	default:
+	}
 	return c.conn.Write(p, c.peerAddr)
+}
+
+func (c *connection) createStream(streamID protocol.StreamID) (*Stream, error) {
+	if c.streams.get(streamID) != nil {
+		c.logger.Log("duplicate_stream", "streamID", streamID)
+		return nil, fmt.Errorf("stream %v already exists", streamID)
+	}
+	stream := newStream(streamID, c.ctx, c.sendQueue, c.wake, func() {
+		_ = c.writeControl(&frame.StreamClose{StreamID: streamID}, true)
+		c.streams.remove(streamID)
+	}, c.logger)
+	c.streams.add(stream)
+	return stream, nil
 }
 
 func (c *connection) close(message string) (err error) {

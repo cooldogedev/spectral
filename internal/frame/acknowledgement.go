@@ -3,7 +3,6 @@ package frame
 import (
 	"encoding/binary"
 	"errors"
-	"slices"
 )
 
 type AcknowledgementRange [2]uint32
@@ -50,26 +49,11 @@ func (fr *Acknowledgement) Decode(p []byte) (int, error) {
 		fr.Ranges[i][0] = binary.LittleEndian.Uint32(p[offset : offset+4])
 		fr.Ranges[i][1] = binary.LittleEndian.Uint32(p[offset+4 : offset+8])
 	}
-	return 12 + int(length)*8, nil
+	return 16 + int(length)*8, nil
 }
 
 func (fr *Acknowledgement) Reset() {
 	fr.Delay = 0
 	fr.Max = 0
 	fr.Ranges = fr.Ranges[:0]
-}
-
-func GenerateAcknowledgementRanges(list []uint32) (ranges []AcknowledgementRange) {
-	slices.Sort(list)
-	start := list[0]
-	end := list[0]
-	for _, value := range list[1:] {
-		if value != end+1 {
-			ranges = append(ranges, AcknowledgementRange{start, end})
-			start = value
-		}
-		end = value
-	}
-	ranges = append(ranges, AcknowledgementRange{start, end})
-	return
 }

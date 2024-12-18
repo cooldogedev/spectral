@@ -16,14 +16,9 @@ var (
 			return &StreamData{Payload: make([]byte, 0, 1452)}
 		},
 	}
-	Pool = sync.Pool{
-		New: func() any {
-			return make([]Frame, 0, 64)
-		},
-	}
 )
 
-func GetFrame(id uint32) (Frame, error) {
+func getFrame(id uint32) (Frame, error) {
 	switch id {
 	case IDAcknowledgement:
 		return acknowledgementPool.Get().(*Acknowledgement), nil
