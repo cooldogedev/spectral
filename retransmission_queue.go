@@ -2,7 +2,6 @@ package spectral
 
 import (
 	"slices"
-	"sort"
 	"sync"
 	"time"
 )
@@ -91,6 +90,13 @@ func (r *retransmissionQueue) clear() {
 
 func (r *retransmissionQueue) sort() {
 	if len(r.queue) > 1 {
-		sort.Slice(r.queue, func(i, j int) bool { return r.queue[i].sent.Before(r.queue[j].sent) })
+		slices.SortFunc(r.queue, func(a, b *retransmissionEntry) int {
+			if a.sent.Before(b.sent) {
+				return -1
+			} else if b.sent.Before(a.sent) {
+				return 1
+			}
+			return 0
+		})
 	}
 }
